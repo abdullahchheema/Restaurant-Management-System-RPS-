@@ -1,0 +1,6 @@
+bin/
+*.class
+db.properties
+backups/
+qa/bin/
+qa/run/db.properties

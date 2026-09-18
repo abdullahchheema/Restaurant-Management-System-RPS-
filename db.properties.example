@@ -1,0 +1,5 @@
+# Copy this file to db.properties (which is gitignored) and fill in real values.
+# NEVER put a real password in this file — it is committed to version control.
+db.url=jdbc:postgresql://localhost:5432/YOUR_DATABASE?reWriteBatchedInserts=true
+db.user=YOUR_DB_USER
+db.password=CHANGE_ME

@@ -1,0 +1,19 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "App",
+            "request": "launch",
+            "mainClass": "rps.app.App",
+            "projectName": "restuarant-management-system_244acca8"
+        },
+        {
+            "type": "java",
+            "name": "Royal Pizza Sahowala",
+            "request": "launch",
+            "mainClass": "rps.app.App",
+            "projectName": "restuarant-management-system"
+        }
+    ]
+}
