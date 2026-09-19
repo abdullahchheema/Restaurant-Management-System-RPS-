@@ -1,0 +1,15 @@
+# This is what a real installed system's db.properties looks like -- for reference only.
+# NEVER fill in real values here; this file is committed to version control.
+#
+# On an installed system this file lives at:
+#   C:\ProgramData\Royal Pizza Sahowala\db.properties
+# and is written automatically by installer\scripts\setup-database.ps1 at install time.
+# It is not meant to be hand-edited: the password is a random 28-character string
+# generated once during installation, and the file's ACL restricts write access to
+# Administrators/SYSTEM (read-only for ordinary users), same as install-credentials.txt.
+#
+# reWriteBatchedInserts=true is a PgJDBC-specific driver optimization (batches multiple
+# INSERT statements into fewer round trips), not a PostgreSQL server setting.
+db.url=jdbc:postgresql://localhost:5432/royal_pizza?reWriteBatchedInserts=true
+db.user=rps_app
+db.password=<28-char-random-string-generated-at-install-time>

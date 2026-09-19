@@ -40,6 +40,24 @@ final class MenuItemEditorDialog extends JDialog {
     private final JCheckBox sizedCheck = new JCheckBox("This item comes in sizes");
     private final JLabel errorLabel = UiFactory.errorText(" ");
 
+    // ---------------------------------------------------------------- photo (uploaded, not typed)
+    private static final int PREVIEW_SIZE = 96;
+    // The container itself carries the photo (or nothing) and NOTHING else — no "No
+    // image" string drawn inside it — so it always reads as a photo slot, never as a
+    // text field that happens to have a border. Any caption belongs above or below it
+    // instead; see imageCaptionAbove / imageHintBelow.
+    private final JLabel imagePreview = imagePlaceholder();
+    private final JLabel imageCaptionAbove = UiFactory.muted("Shown on the New Order screen");
+    private final JLabel imageHintBelow = UiFactory.muted("No photo uploaded yet");
+    private final JButton uploadImageButton = UiFactory.secondaryButton("Upload Image…");
+    private final JButton removeImageButton = UiFactory.secondaryButton("Remove Image");
+    /** Null = no change staged. Non-null bytes = a new/replacement photo to save.
+     *  pendingRemoveImage independently tracks "clear whatever is there" — kept separate
+     *  from pendingImageBytes==null so "no change" and "explicitly remove" aren't the
+     *  same state; nothing here touches the row in the database until Save runs. */
+    private byte[] pendingImageBytes;
+    private boolean pendingRemoveImage;
+
     /** Shown when NOT sized: exactly one price field, no label. */
     private final JTextField singlePriceField = UiFactory.textField(10);
     private final JPanel singlePriceRow = new JPanel(new BorderLayout(8, 0));
@@ -85,6 +103,85 @@ final class MenuItemEditorDialog extends JDialog {
         return header;
     }
 
+    /** Blank — no text is ever drawn inside this box, on principle: a preview slot that
+     *  sometimes contains a word and sometimes contains a photo reads as a text field
+     *  with a border, not as an image slot. Whatever needs saying ("no photo yet", how to
+     *  add one) goes in imageCaptionAbove/imageHintBelow instead, outside the box. */
+    private static JLabel imagePlaceholder() {
+        JLabel l = new JLabel("", SwingConstants.CENTER);
+        l.setPreferredSize(new Dimension(PREVIEW_SIZE, PREVIEW_SIZE));
+        l.setOpaque(true);
+        l.setBackground(Theme.SURFACE_HOVER);
+        l.setBorder(BorderFactory.createLineBorder(Theme.BORDER, 1, true));
+        return l;
+    }
+
+    /** Caption above the box, the box itself (photo or nothing — never text), buttons
+     *  and a status hint below it — the same above/box/below shape PosPanel's own tile
+     *  already uses for the same photo (name above, image, price below), so a manager
+     *  editing the item sees the same layout idea as the tile they're about to produce. */
+    private JComponent buildImageRow() {
+        JPanel column = new JPanel();
+        column.setOpaque(false);
+        column.setLayout(new BoxLayout(column, BoxLayout.Y_AXIS));
+
+        imageCaptionAbove.setAlignmentX(Component.LEFT_ALIGNMENT);
+        column.add(imageCaptionAbove);
+        column.add(Box.createVerticalStrut(6));
+
+        imagePreview.setAlignmentX(Component.LEFT_ALIGNMENT);
+        column.add(imagePreview);
+        column.add(Box.createVerticalStrut(8));
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        buttons.setOpaque(false);
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        buttons.add(uploadImageButton);
+        buttons.add(removeImageButton);
+        column.add(buttons);
+
+        column.add(Box.createVerticalStrut(4));
+        imageHintBelow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        column.add(imageHintBelow);
+
+        return column;
+    }
+
+    private void updateRemoveButtonVisibility() {
+        removeImageButton.setVisible(pendingImageBytes != null
+            || (editing != null && editing.hasImage() && !pendingRemoveImage));
+    }
+
+    /** Reads a file the manager picks from their own device — a plain Open dialog, which
+     *  is exactly what "uploaded from the device" means and is not the kind of save-path
+     *  prompt this app otherwise avoids (that rule is about receipts printing silently
+     *  with no filename prompt; choosing a source photo to attach is a normal, one-time
+     *  admin action, not something that happens on every order). */
+    private void chooseImage() {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Choose a photo for this item");
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter(
+            "Image files", "jpg", "jpeg", "png", "gif", "bmp"));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+
+        try {
+            byte[] resized = rps.util.ImageUtil.loadAndResize(chooser.getSelectedFile().toPath());
+            if (resized == null) {
+                showError("That file doesn't look like an image this app can read.");
+                return;
+            }
+            ImageIcon icon = rps.util.ImageUtil.toIcon(resized, PREVIEW_SIZE);
+            pendingImageBytes = resized;
+            pendingRemoveImage = false;
+            imagePreview.setIcon(icon);
+            imageHintBelow.setText("New photo selected — click Save to apply.");
+            updateRemoveButtonVisibility();
+            showError(" ");
+        } catch (java.io.IOException e) {
+            showError("Could not read that image file: " + e.getMessage());
+        }
+    }
+
     private JPanel buildPresetPalette() {
         JPanel palette = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
         palette.setOpaque(false);
@@ -127,6 +224,37 @@ final class MenuItemEditorDialog extends JDialog {
         singlePriceRow.add(singlePriceField, BorderLayout.CENTER);
 
         customSizeButton.addActionListener(e -> addSizeRowAndFocusLabel("", ""));
+        uploadImageButton.addActionListener(e -> chooseImage());
+        removeImageButton.addActionListener(e -> {
+            boolean wasSavedImage = editing != null && editing.hasImage() && !pendingRemoveImage;
+            pendingImageBytes = null;
+            pendingRemoveImage = wasSavedImage;
+            imagePreview.setIcon(null);
+            imageHintBelow.setText(wasSavedImage
+                ? "Photo will be removed when you Save."
+                : "No photo uploaded yet");
+            updateRemoveButtonVisibility();
+        });
+        removeImageButton.setVisible(false);
+
+        // Fetched once, synchronously — a single-row bytes read on the local database,
+        // no slower in practice than the listOptionGroups() call already made above in
+        // this same constructor, and the dialog is modal so there is nothing else for the
+        // manager to be doing while it completes.
+        if (editing != null && editing.hasImage()) {
+            try {
+                byte[] bytes = menuDao.loadImage(editing.id());
+                ImageIcon icon = rps.util.ImageUtil.toIcon(bytes, PREVIEW_SIZE);
+                if (icon != null) {
+                    imagePreview.setIcon(icon);
+                    imageHintBelow.setText("Click Remove Image to delete this photo.");
+                    removeImageButton.setVisible(true);
+                }
+            } catch (DatabaseException e) {
+                // Missing preview is not worth blocking the editor over — the item's
+                // other fields still load and save normally either way.
+            }
+        }
 
         // Scrollable rather than a fixed-height dialog: the preset palette and a longer
         // size list can easily exceed a fixed size, and clipped content with no way to
@@ -157,6 +285,7 @@ final class MenuItemEditorDialog extends JDialog {
     private JComponent buildForm() {
         JPanel outer = new JPanel(new BorderLayout(0, 12));
         outer.setOpaque(false);
+        TouchScroll.install(outer);
         outer.add(UiFactory.title(editing == null ? "Add Menu Item" : "Edit Menu Item"), BorderLayout.NORTH);
 
         JPanel form = new JPanel(new GridBagLayout());
@@ -180,7 +309,13 @@ final class MenuItemEditorDialog extends JDialog {
         c.gridx = 1;
         form.add(descField, c);
 
-        c.gridx = 0; c.gridy = 3; c.gridwidth = 1;
+        c.gridx = 0; c.gridy = 3; c.gridwidth = 1; c.anchor = GridBagConstraints.NORTHWEST;
+        form.add(UiFactory.labelBold("Photo"), c);
+        c.gridx = 1; c.fill = GridBagConstraints.NONE;
+        form.add(buildImageRow(), c);
+        c.fill = GridBagConstraints.HORIZONTAL; c.anchor = GridBagConstraints.WEST;
+
+        c.gridx = 0; c.gridy = 4; c.gridwidth = 1;
         form.add(UiFactory.labelBold("Option group"), c);
         c.gridx = 1;
         optionGroupCombo.setFont(Theme.FONT_BODY);
@@ -188,10 +323,10 @@ final class MenuItemEditorDialog extends JDialog {
 
         sizedCheck.setFont(Theme.FONT_BODY);
         sizedCheck.setOpaque(false);
-        c.gridx = 0; c.gridy = 4; c.gridwidth = 2;
+        c.gridx = 0; c.gridy = 5; c.gridwidth = 2;
         form.add(sizedCheck, c);
 
-        c.gridy = 5;
+        c.gridy = 6;
         form.add(singlePriceRow, c);
 
         JPanel rowsAndHint = new JPanel();
@@ -217,10 +352,10 @@ final class MenuItemEditorDialog extends JDialog {
         customWrap.add(customSizeButton);
         presetWrap.add(customWrap, BorderLayout.SOUTH);
         sizedBlock.add(presetWrap, BorderLayout.SOUTH);
-        c.gridy = 6;
+        c.gridy = 7;
         form.add(sizedBlock, c);
 
-        c.gridy = 7;
+        c.gridy = 8;
         form.add(errorLabel, c);
 
         outer.add(form, BorderLayout.CENTER);
@@ -419,6 +554,11 @@ final class MenuItemEditorDialog extends JDialog {
                 itemId = editing.id();
             }
             menuDao.setItemOptionGroup(itemId, optionGroupId);
+            if (pendingImageBytes != null) {
+                menuDao.setItemImage(itemId, pendingImageBytes);
+            } else if (pendingRemoveImage) {
+                menuDao.removeItemImage(itemId);
+            }
             onSaved.run();
             dispose();
         } catch (DatabaseException e) {

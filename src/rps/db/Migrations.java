@@ -455,6 +455,211 @@ public final class Migrations {
             // neither needs altering here.
         )));
 
+        // Until now one column answered two unrelated questions: "has the customer paid?"
+        // and "is the food ready / has it gone out?". They genuinely are independent — a
+        // delivery order is routinely cooked and handed over before any cash arrives, and
+        // a dine-in customer can pay up front and still be waiting. Conflating them meant
+        // the counter had no way to say "this one is still being prepared" about an order
+        // that happened to be paid, and cancelling was tangled up with payment state.
+        list.add(new Migration(16, "split order status into payment_status + fulfilment_status", List.of(
+            // ---------------------------------------------------- fulfilment (new track)
+            "ALTER TABLE customer_order ADD COLUMN fulfilment_status VARCHAR(20) NOT NULL DEFAULT 'PENDING'",
+
+            // Backfilled before the CHECK is added. Under the old model a settled order was
+            // one that had been handed over and closed out, so it maps to COMPLETED; a
+            // cancelled one stays cancelled; anything still owing money is treated as
+            // still in the kitchen, which is the safe direction to be wrong in.
+            """
+            UPDATE customer_order SET fulfilment_status =
+                CASE status
+                    WHEN 'CANCELLED'        THEN 'CANCELLED'
+                    WHEN 'PAYMENT_RECEIVED' THEN 'COMPLETED'
+                    ELSE 'PENDING'
+                END
+            """,
+            "ALTER TABLE customer_order ADD CONSTRAINT ck_fulfilment_status "
+                + "CHECK (fulfilment_status IN ('PENDING','COMPLETED','CANCELLED'))",
+
+            // ---------------------------------------------------- status becomes money-only
+            "ALTER TABLE customer_order DROP CONSTRAINT customer_order_status_check",
+
+            // A CANCELLED row carried no payment state of its own, so it is reconstructed
+            // from the amounts actually stored — otherwise a cancelled order that the
+            // customer had already paid would come out looking unpaid.
+            """
+            UPDATE customer_order SET status =
+                CASE
+                    WHEN status = 'PAYMENT_RECEIVED'        THEN 'PAID'
+                    WHEN status = 'PARTIALLY_PAID'          THEN 'PARTIALLY_PAID'
+                    WHEN status = 'PENDING'                 THEN 'UNPAID'
+                    WHEN amount_paid >= total AND total > 0 THEN 'PAID'
+                    WHEN amount_paid > 0                    THEN 'PARTIALLY_PAID'
+                    ELSE 'UNPAID'
+                END
+            """,
+            "ALTER TABLE customer_order RENAME COLUMN status TO payment_status",
+            "ALTER TABLE customer_order ALTER COLUMN payment_status SET DEFAULT 'UNPAID'",
+            "ALTER TABLE customer_order ADD CONSTRAINT ck_payment_status "
+                + "CHECK (payment_status IN ('UNPAID','PARTIALLY_PAID','PAID'))",
+            // Both dashboard panes and every reporting query now filter on one or both of
+            // these, and there is no surviving index on the old status column — migration 7
+            // dropped ix_order_active and nothing replaced it.
+            "CREATE INDEX ix_order_payment_status ON customer_order (business_date, payment_status)",
+            "CREATE INDEX ix_order_fulfilment ON customer_order (business_date, fulfilment_status)",
+
+            // ---------------------------------------------------- history says which track moved
+            "ALTER TABLE order_status_history ADD COLUMN status_kind VARCHAR(12) NOT NULL DEFAULT 'PAYMENT'",
+            "UPDATE order_status_history SET status_kind = 'FULFILMENT' "
+                + "WHERE to_status = 'CANCELLED' OR from_status = 'CANCELLED'",
+            "UPDATE order_status_history SET to_status = 'PAID' WHERE to_status = 'PAYMENT_RECEIVED'",
+            "UPDATE order_status_history SET from_status = 'PAID' WHERE from_status = 'PAYMENT_RECEIVED'",
+            "UPDATE order_status_history SET to_status = 'UNPAID' "
+                + "WHERE to_status = 'PENDING' AND status_kind = 'PAYMENT'",
+            "UPDATE order_status_history SET from_status = 'UNPAID' "
+                + "WHERE from_status = 'PENDING' AND status_kind = 'PAYMENT'",
+            "ALTER TABLE order_status_history ADD CONSTRAINT ck_status_kind "
+                + "CHECK (status_kind IN ('PAYMENT','FULFILMENT'))"
+        )));
+
+        // A photo per menu item, uploaded from the manager's own device (see
+        // MenuItemEditorDialog / rps.util.ImageUtil). Stored as bytes IN the database
+        // rather than as a file path on disk: this app already treats the database as the
+        // one thing that gets backed up (OffsiteBackupService dumps it, nothing else), and
+        // a filesystem path would mean either the image silently isn't backed up, or a
+        // second backup mechanism to keep in sync with the first. Every upload is resized
+        // and re-encoded to a small JPEG before it ever reaches this column, so a photo
+        // straight off a phone does not bloat every row or the POS's polling payload.
+        list.add(new Migration(17, "menu item photo", List.of(
+            "ALTER TABLE menu_item ADD COLUMN image BYTEA"
+        )));
+
+        // Lets a cashier waive the phone requirement for a Takeaway/Delivery customer
+        // who won't give one (OrderDraft.phoneNotRequired / the "No phone number" toggle
+        // on PosPanel and OrderEditDialog). Migration 11's ck_phone_required enforced
+        // "phone required unless Dine-in" as a database invariant, which is exactly what
+        // this feature needs to NOT be true any more — it is now a per-order business
+        // decision the cashier makes, not something every row must satisfy regardless.
+        // Reproduced live: without this, saveOrder() passed its own Java-side check
+        // (OrderDraft.isCustomerInfoValid already respects the toggle) and then failed
+        // at the INSERT with a raw constraint-violation error instead of saving. No
+        // replacement constraint is added — Validators.isValidPakistaniPhone still runs
+        // in Java on any phone that IS entered, toggle or not, so a well-formed-or-absent
+        // phone is still all that is ever accepted; this migration only removes the part
+        // that forced one to be present.
+        list.add(new Migration(18, "phone requirement is a business choice, not a DB constraint", List.of(
+            "ALTER TABLE customer_order DROP CONSTRAINT ck_phone_required"
+        )));
+
+        // Migration 4's original, inline (never named) CHECK on customer_order was its own
+        // separate rule for Delivery orders specifically: phone non-blank AND address at
+        // least 10 characters. Migration 18 above only dropped the LATER, general-purpose
+        // ck_phone_required (added in migration 8) — it never touched this older one, so
+        // a Delivery order saved with the phone-not-required toggle ticked and a blank
+        // phone would still have failed at the INSERT with a raw constraint violation,
+        // exactly the migration-18 bug but for Delivery instead of Takeaway. Dropping it
+        // by definition, not by name, because it was never named — same technique as
+        // ck_total_equation in migration 10.
+        list.add(new Migration(19, "delivery address no longer has a 10-character floor; phone toggle applies to delivery too", List.of(
+            """
+            DO $$
+            DECLARE con_name text;
+            BEGIN
+                SELECT conname INTO con_name
+                FROM pg_constraint
+                WHERE conrelid = 'customer_order'::regclass
+                  AND contype = 'c'
+                  AND pg_get_constraintdef(oid) ILIKE '%delivery_address%'
+                  AND pg_get_constraintdef(oid) ILIKE '%10%';
+                IF con_name IS NOT NULL THEN
+                    EXECUTE 'ALTER TABLE customer_order DROP CONSTRAINT ' || quote_ident(con_name);
+                END IF;
+            END $$
+            """,
+            // Replacement only requires a non-blank address for Delivery — no minimum
+            // length, and no phone requirement at all: whether a phone is mandatory is
+            // now entirely OrderDraft.phoneNotRequired's call, enforced in Java exactly
+            // the same way for every order type, not duplicated here.
+            "ALTER TABLE customer_order ADD CONSTRAINT ck_delivery_address_required "
+                + "CHECK (order_type <> 'DELIVERY' OR "
+                + "(delivery_address IS NOT NULL AND length(btrim(delivery_address)) > 0))"
+        )));
+
+        // "Pay later" / loan: a customer walks out owing money, by agreement. This is a
+        // THIRD track, deliberately not a payment_status value — payment_status is derived
+        // from amount_paid on every applyPayment call, so anything stored there would be
+        // overwritten the moment a customer pays part of what they owe, which is exactly
+        // when a loan most needs to stay a loan. loan_at IS NULL / NOT NULL is the flag;
+        // storing the timestamp rather than a boolean means "when was credit given" comes
+        // free, and loan_staff_id records who agreed to it.
+        //
+        // The accounting consequence (a deliberate business decision, not an accident):
+        // a loan order counts as revenue immediately even though the cash has not arrived,
+        // and stops counting as outstanding/unpaid — the money owed is tracked as a
+        // receivable in the Pay Later screen instead. See OrderDao#dailySummary.
+        list.add(new Migration(20, "pay-later (loan) orders", List.of(
+            "ALTER TABLE customer_order ADD COLUMN loan_at TIMESTAMPTZ",
+            "ALTER TABLE customer_order ADD COLUMN loan_staff_id INT REFERENCES staff(id)",
+            // Partial: only loan rows are ever looked up by this, and they are a small
+            // minority of the table — same shape as ix_order_delivery_run above.
+            "CREATE INDEX ix_order_loan ON customer_order (loan_at) WHERE loan_at IS NOT NULL",
+            // A cancelled order is void: there is no debt to collect, so it can never also
+            // be an outstanding loan. Enforced here rather than only in Java because this
+            // one IS expressible as a row invariant (unlike the time-window rules).
+            "ALTER TABLE customer_order ADD CONSTRAINT ck_loan_not_cancelled "
+                + "CHECK (loan_at IS NULL OR fulfilment_status <> 'CANCELLED')"
+        )));
+
+        // A debt that has been collected in full is no longer a debt: it leaves the Pay
+        // Later ledger and goes back to the Dashboard as an ordinary settled order, which
+        // is what this column records. The pair (loan_at, loan_settled_at) is what decides
+        // where an order is shown — "on the ledger" is loan_at IS NOT NULL AND
+        // loan_settled_at IS NULL, and the Dashboard shows exactly the complement.
+        //
+        // Kept as a settled-marker rather than just clearing loan_at, so the fact that an
+        // order was once sold on credit (and when it was cleared) survives — clearing the
+        // flag would make a repaid credit sale indistinguishable from a cash one.
+        //
+        // Revenue is deliberately NOT affected by settling: the total was already
+        // recognised when credit was given, and OrderDao#dailySummary's
+        // (payment_status = 'PAID' OR loan_at IS NOT NULL) matches such a row exactly once
+        // whichever side of settlement it is on.
+        list.add(new Migration(21, "a fully collected loan returns to the dashboard", List.of(
+            "ALTER TABLE customer_order ADD COLUMN loan_settled_at TIMESTAMPTZ",
+            "ALTER TABLE customer_order ADD CONSTRAINT ck_loan_settled_implies_loan "
+                + "CHECK (loan_settled_at IS NULL OR loan_at IS NOT NULL)",
+            // Replaces migration 20's index: every lookup is for rows still ON the ledger,
+            // which is a shrinking subset of all the loans ever given.
+            "DROP INDEX IF EXISTS ix_order_loan",
+            "CREATE INDEX ix_order_loan_open ON customer_order (loan_at) "
+                + "WHERE loan_at IS NOT NULL AND loan_settled_at IS NULL"
+        )));
+
+        // Backfill for rows created between migration 20 landing and migration 21's
+        // auto-settle logic landing in OrderDao#applyPayment: any loan that reached PAID
+        // during that window has no loan_settled_at at all, so it is stuck showing
+        // "Still Owed Rs 0.00" on the Pay Later ledger forever, with no way to clear it
+        // (Collect demands an amount greater than zero, which a paid-up order has none of).
+        // Settled "now" rather than backdated to when it actually paid off, since the exact
+        // moment was never recorded for these rows.
+        list.add(new Migration(22, "backfill loan_settled_at for loans that reached PAID before auto-settle existed", List.of(
+            "UPDATE customer_order SET loan_settled_at = now() "
+                + "WHERE loan_at IS NOT NULL AND loan_settled_at IS NULL AND payment_status = 'PAID'"
+        )));
+
+        // Rider/delivery-run tracking (migration 14) removed outright — not the DELIVERY
+        // order type itself, which stays exactly as it was (customers still place
+        // delivery orders with an address and a delivery fee); this drops only the
+        // separate "assign a rider, dispatch a run, settle it on return" feature that
+        // used to live on its own tab. Order matters: the column has to go before the
+        // table it references, and delivery_run before rider for the same reason —
+        // dropping a column also drops the partial index and FK that depended on it,
+        // same as a table drop takes its own indexes and constraints with it.
+        list.add(new Migration(23, "remove rider/delivery-run tracking", List.of(
+            "ALTER TABLE customer_order DROP COLUMN delivery_run_id",
+            "DROP TABLE delivery_run",
+            "DROP TABLE rider"
+        )));
+
         return list;
     }
 

@@ -162,7 +162,7 @@ public final class ConcurrencySuite {
 
         Order paid = orderDao.loadOrderForPrint(payTarget.id());
         System.out.printf("    %d x %s against total %s -> amount_paid=%s status=%s (accepted=%d)%n",
-            payers, slice, total, paid.totals().amountPaid(), paid.status(), accepted.get());
+            payers, slice, total, paid.totals().amountPaid(), paid.paymentStatus(), accepted.get());
         check("CONC-PAY", "Concurrent payments: amount_paid never exceeds total, no lost update",
             paid.totals().amountPaid().compareTo(total) <= 0
                 && paid.totals().amountPaid().equals(total),
@@ -182,7 +182,7 @@ public final class ConcurrencySuite {
             AtomicReference<Boolean> cancelOk = new AtomicReference<>(false);
             AtomicReference<Boolean> payOk = new AtomicReference<>(false);
             p.submit(() -> { try { g.await();
-                cancelOk.set(orderDao.updateStatus(t.id(), OrderStatus.PENDING, OrderStatus.CANCELLED, 1));
+                cancelOk.set(orderDao.updateFulfilment(t.id(), FulfilmentStatus.PENDING, FulfilmentStatus.CANCELLED, 1, false));
             } catch (Exception ignored) {} });
             p.submit(() -> { try { g.await();
                 payOk.set(orderDao.recordPayment(t.id(), t.totals().total(), 1));
@@ -191,12 +191,18 @@ public final class ConcurrencySuite {
             p.shutdown();
             p.awaitTermination(30, TimeUnit.SECONDS);
             Order fin = orderDao.loadOrderForPrint(t.id());
-            // A cancelled order must not also be settled, and vice versa.
-            boolean inconsistent = fin.status() == OrderStatus.CANCELLED
-                && fin.totals().amountPaid().isPositive();
+            // Cancelling now deletes the order outright, so "cancel won the race" means
+            // the row is gone entirely -- which is consistent by construction, since a
+            // deleted row cannot also count toward revenue, hold a balance, or show up
+            // anywhere else. The only way this race could still leave something
+            // inconsistent is if the order SURVIVED (cancel lost, or never got a chance)
+            // but somehow ended up with money recorded without the payment status
+            // reflecting it.
+            boolean inconsistent = fin != null
+                && fin.totals().amountPaid().isPositive() && !fin.paymentStatus().isPaid();
             if (inconsistent) bothWon.incrementAndGet();
         }
-        check("CONC-RACE", "Cancel/pay race never leaves a CANCELLED order holding money",
+        check("CONC-RACE", "Cancel/pay race never leaves money counted on a cancelled order",
             bothWon.get() == 0, bothWon.get() + "/" + raceN + " inconsistent");
 
         int violations = integritySweep(db, "after concurrency suite");

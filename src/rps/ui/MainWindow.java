@@ -4,19 +4,29 @@ import rps.app.Session;
 import rps.backup.OffsiteBackupService;
 import rps.db.Db;
 import rps.print.ReceiptPrinter;
+import rps.ui.icon.LineIcon;
 import rps.ui.theme.Theme;
 import rps.ui.theme.UiFactory;
 
 import javax.swing.*;
 import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * The main application window. Only ever constructed with a non-null Session (see
  * LoginWindow) — this is the structural half of login enforcement. The cosmetic half
- * (which tabs exist at all) also follows the session: manager-only screens are not
- * merely disabled, they are never added to the tab strip for a non-manager session.
+ * (which screens exist at all) also follows the session: manager-only screens are not
+ * merely disabled, they are never added to the sidebar for a non-manager session.
+ *
+ * <p>Navigation is a left icon sidebar (one button per screen, screens shown via
+ * CardLayout) rather than a top JTabbedPane — a deliberate layout choice matching the
+ * reference the shop was built to, not a functional change: exactly the same set of
+ * screens exists, gated by the same role check as before.
  */
 public final class MainWindow extends JFrame {
+
+    private static final int SIDEBAR_WIDTH = 76;
 
     private final Db db;
     private final Session session;
@@ -40,6 +50,14 @@ public final class MainWindow extends JFrame {
     private final JLabel warningChip = warningChipStyled();
     private String lastWarning;
 
+    /** One entry per screen the current session can see, in sidebar order. */
+    private record ScreenEntry(String name, LineIcon icon, String cardKey, JComponent component) {}
+
+    private final List<ScreenEntry> screens = new ArrayList<>();
+    private final List<SidebarButton> sidebarButtons = new ArrayList<>();
+    private final CardLayout contentCards = new CardLayout();
+    private final JPanel contentHolder = new JPanel(contentCards);
+
     public MainWindow(Db db, Session session, OffsiteBackupService offsiteBackupService) {
         super("Royal Pizza Sahowala");
         this.db = db;
@@ -53,7 +71,13 @@ public final class MainWindow extends JFrame {
 
         setLayout(new BorderLayout());
         add(buildHeader(), BorderLayout.NORTH);
-        add(buildTabs(), BorderLayout.CENTER);
+
+        JComponent content = buildContent();   // populates `screens` — must run before buildSidebar()
+        JPanel body = new JPanel(new BorderLayout());
+        body.setOpaque(false);
+        body.add(buildSidebar(), BorderLayout.WEST);
+        body.add(content, BorderLayout.CENTER);
+        add(body, BorderLayout.CENTER);
 
         // Cheap liveness poll — this is what surfaces a lost database connection to the
         // user instead of the dashboard just quietly going stale with no explanation.
@@ -170,7 +194,7 @@ public final class MainWindow extends JFrame {
 
         JPanel printerBox = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 0));
         printerBox.setOpaque(false);
-        printerBox.add(new JLabel(rps.ui.icon.LineIcon.PRINT.of(16, Theme.TEXT_MUTED)));
+        printerBox.add(new JLabel(LineIcon.PRINT.of(16, Theme.TEXT_MUTED)));
         printerDot.setFont(Theme.FONT_SMALL);
         printerBox.add(printerDot);
         printerBox.add(printerLabel);
@@ -183,7 +207,7 @@ public final class MainWindow extends JFrame {
         statusBox.add(connectionLabel);
         right.add(statusBox);
 
-        JLabel avatar = new JLabel(rps.ui.icon.LineIcon.PERSON.of(22, Theme.TEXT_MUTED));
+        JLabel avatar = new JLabel(LineIcon.PERSON.of(22, Theme.TEXT_MUTED));
         right.add(avatar);
 
         JPanel whoBox = new JPanel();
@@ -197,7 +221,7 @@ public final class MainWindow extends JFrame {
         whoBox.add(role);
         right.add(whoBox);
         JButton logout = UiFactory.secondaryButton("Logout");
-        logout.setIcon(rps.ui.icon.LineIcon.LOGOUT.of(15, Theme.TEXT_MUTED));
+        logout.setIcon(LineIcon.LOGOUT.of(15, Theme.TEXT_MUTED));
         logout.setIconTextGap(8);
         logout.addActionListener(e -> logout());
         right.add(logout);
@@ -206,27 +230,124 @@ public final class MainWindow extends JFrame {
         return header;
     }
 
-    private JComponent buildTabs() {
-        // Font set once in Theme.install() via UIManager — not re-set here to avoid
-        // two places that can silently diverge.
-        JTabbedPane tabs = new JTabbedPane();
+    /** Populates {@code screens} and the CardLayout content panel. Must run before
+     *  {@link #buildSidebar()}, which reads the same list to build one button per entry. */
+    private JComponent buildContent() {
+        contentHolder.setOpaque(false);
 
-        tabs.addTab("New Order", new PosPanel(db, session, offsiteBackupService));
-        tabs.addTab("Dashboard", new DashboardPanel(db, session));
-        tabs.addTab("Deliveries", new DeliveryPanel(db, session));
+        addScreen("New Order", LineIcon.CART, new PosPanel(db, session, offsiteBackupService));
+        addScreen("Dashboard", LineIcon.DASHBOARD, new DashboardPanel(db, session));
+        // Not manager-only: whoever is at the counter is the one who takes the money back
+        // off a customer who owes it, so a cashier has to be able to see and settle a debt.
+        addScreen("Pay Later", LineIcon.WALLET, new LoanPanel(db, session));
 
-        // Manager-only tabs are never added for a non-manager session — not disabled, absent.
+        // Manager-only screens are never added for a non-manager session — not disabled, absent.
         if (session.isManager()) {
-            tabs.addTab("Menu", new MenuAdminPanel(db, session));
-            tabs.addTab("Staff", new StaffAdminPanel(db, session));
-            tabs.addTab("Reports", new ReportsPanel(db, session));
-            tabs.addTab("Settings", new SettingsPanel(db, session, offsiteBackupService));
+            addScreen("Menu", LineIcon.LIST, new MenuAdminPanel(db, session));
+            addScreen("Staff", LineIcon.TEAM, new StaffAdminPanel(db, session));
+            addScreen("Reports", LineIcon.CHART, new ReportsPanel(db, session));
+            addScreen("Settings", LineIcon.GEAR, new SettingsPanel(db, session, offsiteBackupService));
         }
 
-        return tabs;
+        return contentHolder;
+    }
+
+    private void addScreen(String name, LineIcon icon, JComponent panel) {
+        String key = "screen-" + screens.size();
+        screens.add(new ScreenEntry(name, icon, key, panel));
+        contentHolder.add(panel, key);
+    }
+
+    private JComponent buildSidebar() {
+        JPanel sidebar = new JPanel();
+        sidebar.setLayout(new BoxLayout(sidebar, BoxLayout.Y_AXIS));
+        sidebar.setBackground(Theme.PRIMARY_DARK);
+        sidebar.setBorder(BorderFactory.createEmptyBorder(20, 0, 20, 0));
+        sidebar.setPreferredSize(new Dimension(SIDEBAR_WIDTH, 0));
+
+        ButtonGroup group = new ButtonGroup();
+        for (int i = 0; i < screens.size(); i++) {
+            ScreenEntry entry = screens.get(i);
+            SidebarButton btn = new SidebarButton(entry.icon(), entry.name());
+            final int index = i;
+            btn.addActionListener(e -> selectScreen(index));
+            group.add(btn);
+            sidebarButtons.add(btn);
+            btn.setAlignmentX(Component.CENTER_ALIGNMENT);
+            sidebar.add(btn);
+            sidebar.add(Box.createVerticalStrut(6));
+        }
+        if (!sidebarButtons.isEmpty()) sidebarButtons.get(0).setSelected(true);
+        sidebar.add(Box.createVerticalGlue());
+        return sidebar;
+    }
+
+    /** Icon-only nav button: a translucent icon at rest, full white plus a rounded
+     *  highlight and a gold accent tab on the left edge when selected — the sidebar's own
+     *  dark ground is what the translucency is tuned against, so this stays private to it
+     *  rather than living in UiFactory alongside the light-surface widgets. */
+    private static final class SidebarButton extends JToggleButton {
+        private static final Color DIM_ICON = new Color(0xFF, 0xFF, 0xFF, 0xA8);
+
+        SidebarButton(LineIcon icon, String tooltip) {
+            setToolTipText(tooltip);
+            setIcon(icon.of(22, DIM_ICON));
+            setSelectedIcon(icon.of(22, Theme.ON_PRIMARY));
+            setOpaque(false);
+            setContentAreaFilled(false);
+            setBorderPainted(false);
+            setFocusPainted(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            setHorizontalAlignment(SwingConstants.CENTER);
+            Dimension size = new Dimension(MainWindow.SIDEBAR_WIDTH, 52);
+            setPreferredSize(size);
+            setMaximumSize(size);
+        }
+
+        @Override
+        protected void paintComponent(Graphics g) {
+            if (isSelected()) {
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(Theme.PRIMARY);
+                int pad = 10;
+                g2.fillRoundRect(pad, 2, getWidth() - pad * 2, getHeight() - 4, 12, 12);
+                g2.setColor(Theme.ACCENT);
+                g2.fillRoundRect(0, 12, 4, getHeight() - 24, 4, 4);
+                g2.dispose();
+            }
+            super.paintComponent(g);
+        }
+    }
+
+    // ---------------------------------------------------------------- test/navigation hooks
+
+    /** How many screens this session's sidebar shows — for the UI test suite, which has
+     *  no JTabbedPane to introspect any more. */
+    public int screenCount() {
+        return screens.size();
+    }
+
+    public String screenNameAt(int index) {
+        return screens.get(index).name();
+    }
+
+    public Component screenComponentAt(int index) {
+        return screens.get(index).component();
+    }
+
+    /** Switches the CardLayout to the given screen and reflects that in the sidebar's own
+     *  selection state — used by sidebar clicks and by the UI test suite driving navigation
+     *  without simulating a real mouse event. */
+    public void selectScreen(int index) {
+        contentCards.show(contentHolder, screens.get(index).cardKey());
+        if (!sidebarButtons.get(index).isSelected()) {
+            sidebarButtons.get(index).setSelected(true);
+        }
     }
 
     private void logout() {
+        rps.util.AppSettings.get().setStayedSignedInStaffId(null);
         connectionTimer.stop();
         dispose();
         SwingUtilities.invokeLater(() -> new LoginWindow(db, offsiteBackupService).setVisible(true));

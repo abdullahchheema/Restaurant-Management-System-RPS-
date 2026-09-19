@@ -1,5 +1,7 @@
 package rps.ui.theme;
 
+import rps.ui.TouchScroll;
+
 import javax.swing.JPanel;
 import javax.swing.border.EmptyBorder;
 import java.awt.BorderLayout;
@@ -29,6 +31,16 @@ public class Card extends JPanel {
         super(layout);
         setOpaque(false);
         setBorder(new EmptyBorder(16, 16, 16, 16));
+        // A Card is opaque-looking and normally fills most of whatever container it sits
+        // in, so on a touchscreen till it is most of the actual surface a finger lands
+        // on — wiring drag-to-scroll only on the THIN gaps around cards (as every screen
+        // built on top of Card used to do) left the card bodies themselves dead to touch,
+        // which is most of the screen. One installation here covers every Card in the
+        // app at once. Harmless where a caller also wires its own more specific tap
+        // action on the same instance (MenuAdminPanel's item cards) — this is a no-op
+        // tap, so it just adds a second (redundant, not
+        // conflicting) drag listener alongside it.
+        TouchScroll.install(this);
     }
 
     @Override

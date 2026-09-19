@@ -197,6 +197,110 @@ public enum LineIcon {
             g.draw(new Line2D.Float(10, 3, 10, 17));
             g.draw(new Line2D.Float(3, 10, 17, 10));
         }
+    },
+    /** Sidebar nav: New Order. */
+    CART {
+        @Override void draw(Graphics2D g) {
+            GeneralPath basket = new GeneralPath();
+            basket.moveTo(4, 6); basket.lineTo(17, 6); basket.lineTo(15, 14); basket.lineTo(6, 14);
+            basket.closePath();
+            g.draw(basket);
+            g.draw(new Line2D.Float(1.5f, 3, 4, 6));
+            g.draw(new Ellipse2D.Float(6.5f, 15.5f, 3, 3));
+            g.draw(new Ellipse2D.Float(12.5f, 15.5f, 3, 3));
+        }
+    },
+    /** Sidebar nav: Dashboard. */
+    DASHBOARD {
+        @Override void draw(Graphics2D g) {
+            g.draw(new Line2D.Float(2, 17, 18, 17));
+            g.draw(new Line2D.Float(4.5f, 17, 4.5f, 10));
+            g.draw(new Line2D.Float(10, 17, 10, 4));
+            g.draw(new Line2D.Float(15.5f, 17, 15.5f, 12));
+        }
+    },
+    /** Sidebar nav: Pay Later. */
+    WALLET {
+        @Override void draw(Graphics2D g) {
+            g.draw(new RoundRectangle2D.Float(2, 5, 16, 11, 2, 2));
+            g.draw(new Line2D.Float(2, 9, 18, 9));
+            g.draw(new Ellipse2D.Float(13, 11.5f, 2.4f, 2.4f));
+        }
+    },
+    /** Sidebar nav: Staff. */
+    TEAM {
+        @Override void draw(Graphics2D g) {
+            g.draw(new Ellipse2D.Float(2.5f, 3, 6, 6));
+            GeneralPath back = new GeneralPath();
+            back.moveTo(1, 17);
+            back.curveTo(1, 12.5f, 3.5f, 11, 5.5f, 11);
+            back.curveTo(7.5f, 11, 10, 12.5f, 10, 17);
+            g.draw(back);
+
+            g.draw(new Ellipse2D.Float(11.5f, 4, 5, 5));
+            GeneralPath front = new GeneralPath();
+            front.moveTo(9.5f, 17);
+            front.curveTo(9.5f, 13, 11.8f, 11.5f, 14, 11.5f);
+            front.curveTo(16.2f, 11.5f, 18.5f, 13, 18.5f, 17);
+            g.draw(front);
+        }
+    },
+    /** Sidebar nav: Reports. */
+    CHART {
+        @Override void draw(Graphics2D g) {
+            g.draw(new Line2D.Float(2.5f, 18, 2.5f, 2));
+            g.draw(new Line2D.Float(2.5f, 18, 18, 18));
+            GeneralPath trend = new GeneralPath();
+            trend.moveTo(4.5f, 14); trend.lineTo(8, 10); trend.lineTo(11, 12.5f); trend.lineTo(16.5f, 5.5f);
+            g.draw(trend);
+            GeneralPath arrow = new GeneralPath();
+            arrow.moveTo(12.5f, 5.5f); arrow.lineTo(16.5f, 5.5f); arrow.lineTo(16.5f, 9.5f);
+            g.draw(arrow);
+        }
+    },
+    /** Sidebar nav: Settings. */
+    GEAR {
+        @Override void draw(Graphics2D g) {
+            g.draw(new Ellipse2D.Float(6, 6, 8, 8));
+            g.draw(new Ellipse2D.Float(8.3f, 8.3f, 3.4f, 3.4f));
+            for (int i = 0; i < 6; i++) {
+                double angle = Math.toRadians(i * 60);
+                float x1 = 10 + (float) (Math.cos(angle) * 5.2);
+                float y1 = 10 + (float) (Math.sin(angle) * 5.2);
+                float x2 = 10 + (float) (Math.cos(angle) * 8.6);
+                float y2 = 10 + (float) (Math.sin(angle) * 8.6);
+                g.draw(new Line2D.Float(x1, y1, x2, y2));
+            }
+        }
+    },
+    /** Sidebar nav: Menu (admin). */
+    LIST {
+        @Override void draw(Graphics2D g) {
+            g.draw(new RoundRectangle2D.Float(3, 2, 14, 16, 2, 2));
+            g.draw(new Line2D.Float(6, 7, 14, 7));
+            g.draw(new Line2D.Float(6, 10.5f, 14, 10.5f));
+            g.draw(new Line2D.Float(6, 14, 11, 14));
+        }
+    },
+    CHEVRON_LEFT {
+        @Override void draw(Graphics2D g) {
+            GeneralPath p = new GeneralPath();
+            p.moveTo(13, 3); p.lineTo(6, 10); p.lineTo(13, 17);
+            g.draw(p);
+        }
+    },
+    CHEVRON_RIGHT {
+        @Override void draw(Graphics2D g) {
+            GeneralPath p = new GeneralPath();
+            p.moveTo(7, 3); p.lineTo(14, 10); p.lineTo(7, 17);
+            g.draw(p);
+        }
+    },
+    SEARCH {
+        @Override void draw(Graphics2D g) {
+            g.draw(new Ellipse2D.Float(3, 3, 10, 10));
+            g.draw(new Line2D.Float(11.5f, 11.5f, 17.5f, 17.5f));
+        }
     };
 
     abstract void draw(Graphics2D g);

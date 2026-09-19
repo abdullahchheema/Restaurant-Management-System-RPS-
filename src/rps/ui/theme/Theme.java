@@ -149,20 +149,34 @@ public final class Theme {
         }
     }
 
-    public static Color statusColor(rps.model.OrderStatus status) {
+    public static Color statusColor(rps.model.PaymentStatus status) {
         return switch (status) {
-            // Pending and Partially Paid share the amber "still owes money" family —
+            // Unpaid and Partially Paid share the amber "still owes money" family —
             // they are the same operational state, distinguished by label, not colour.
-            case PENDING, PARTIALLY_PAID -> STATUS_PENDING;
-            case PAYMENT_RECEIVED -> STATUS_COMPLETED;
+            case UNPAID, PARTIALLY_PAID -> STATUS_PENDING;
+            case PAID -> STATUS_COMPLETED;
+        };
+    }
+
+    public static Color statusTint(rps.model.PaymentStatus status) {
+        return switch (status) {
+            case UNPAID, PARTIALLY_PAID -> STATUS_PENDING_TINT;
+            case PAID -> STATUS_COMPLETED_TINT;
+        };
+    }
+
+    public static Color fulfilmentColor(rps.model.FulfilmentStatus status) {
+        return switch (status) {
+            case PENDING -> STATUS_PENDING;
+            case COMPLETED -> STATUS_COMPLETED;
             case CANCELLED -> STATUS_CANCELLED;
         };
     }
 
-    public static Color statusTint(rps.model.OrderStatus status) {
+    public static Color fulfilmentTint(rps.model.FulfilmentStatus status) {
         return switch (status) {
-            case PENDING, PARTIALLY_PAID -> STATUS_PENDING_TINT;
-            case PAYMENT_RECEIVED -> STATUS_COMPLETED_TINT;
+            case PENDING -> STATUS_PENDING_TINT;
+            case COMPLETED -> STATUS_COMPLETED_TINT;
             case CANCELLED -> STATUS_CANCELLED_TINT;
         };
     }

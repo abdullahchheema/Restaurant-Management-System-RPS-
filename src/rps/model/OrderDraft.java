@@ -26,6 +26,11 @@ public final class OrderDraft {
     private DiscountMode discountMode = DiscountMode.NONE;
     private BigDecimal discountValue;   // percent (0-100) if PERCENT, rupee amount if AMOUNT
     private Money cashTendered;
+    /** Cashier-ticked override for a Takeaway/Delivery customer who won't give a phone
+     *  number. Off by default — the ordinary rule (phone required, format-checked) still
+     *  applies unless this is explicitly set for THIS order. Never persisted: it only
+     *  affects this draft's own validation, not anything written to the database. */
+    private boolean phoneNotRequired;
 
     /** Clears every field back to its initial state. Call this instead of hand-clearing
      *  fields one by one — that pattern is exactly how a discount would leak to the next
@@ -41,6 +46,7 @@ public final class OrderDraft {
         discountMode = DiscountMode.NONE;
         discountValue = null;
         cashTendered = null;
+        phoneNotRequired = false;
     }
 
     /**
@@ -65,6 +71,7 @@ public final class OrderDraft {
         copy.discountMode = this.discountMode;
         copy.discountValue = this.discountValue;
         copy.cashTendered = this.cashTendered;
+        copy.phoneNotRequired = this.phoneNotRequired;
         return copy;
     }
 
@@ -157,18 +164,29 @@ public final class OrderDraft {
         this.cashTendered = cashTendered;
     }
 
+    public boolean isPhoneNotRequired() {
+        return phoneNotRequired;
+    }
+
+    public void setPhoneNotRequired(boolean phoneNotRequired) {
+        this.phoneNotRequired = phoneNotRequired;
+    }
+
     /** Phone is required and format-checked for Takeaway/Delivery; optional for Dine-in
-     *  (no pickup contact or address to confirm it against), but if one is entered
-     *  anyway it still has to be well-formed rather than silently accepted as garbage.
-     *  Address is required only for Delivery. Table number is required only for Dine-in. */
+     *  (no pickup contact or address to confirm it against) or when the cashier has
+     *  ticked phoneNotRequired for a customer who won't give one — but either way, a
+     *  phone that IS entered still has to be well-formed rather than silently accepted
+     *  as garbage. Address is required only for Delivery, unaffected by the phone
+     *  toggle. Table number is required only for Dine-in. */
     public boolean isCustomerInfoValid() {
         boolean phoneBlank = Validators.isBlank(customerPhone);
-        if (type == OrderType.DINE_IN) {
+        boolean phoneOptionalHere = type == OrderType.DINE_IN || phoneNotRequired;
+        if (phoneOptionalHere) {
             if (!phoneBlank && !Validators.isValidPakistaniPhone(customerPhone)) return false;
-            if (Validators.isBlank(tableNumber)) return false;
         } else if (!Validators.isValidPakistaniPhone(customerPhone)) {
             return false;
         }
+        if (type == OrderType.DINE_IN && Validators.isBlank(tableNumber)) return false;
         if (type == OrderType.DELIVERY) {
             return Validators.isValidAddress(deliveryAddress);
         }

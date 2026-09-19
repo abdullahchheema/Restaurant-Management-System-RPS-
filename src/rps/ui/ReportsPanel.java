@@ -80,6 +80,7 @@ public final class ReportsPanel extends JPanel {
         // Dashboard's stat numbers stand out from surrounding neutral text — the
         // Revenue column stays plain since money is already the reader's default focus.
         table.getColumnModel().getColumn(1).setCellRenderer(countCellRenderer());
+        TouchScroll.install(table);
 
         CardLayout cards = new CardLayout();
         JPanel holder = new JPanel(cards);

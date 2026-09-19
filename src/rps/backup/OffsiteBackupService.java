@@ -315,12 +315,26 @@ public final class OffsiteBackupService {
         }
     }
 
-    /** Resolution order: explicit setting -> standard install roots (newest version
-     *  first, since pg_dump refuses to dump a server newer than itself) -> PATH. */
+    /** Resolution order: explicit setting -> bundled install (rps.pgsql.home, set by the
+     *  installed launcher) -> standard EDB install roots (newest version first, since
+     *  pg_dump refuses to dump a server newer than itself). There is deliberately no PATH
+     *  fallback — a bare `pg_dump` on PATH is never attempted, whatever the javadoc used
+     *  to imply; every candidate here is an absolute path, checked to exist before use. */
     private Optional<Path> locatePgDump() {
         String configured = AppSettings.get().pgDumpPath();
         if (configured != null && !configured.isBlank()) {
             Path p = Path.of(configured);
+            if (Files.isRegularFile(p)) return Optional.of(p);
+        }
+
+        // Set by the installed launcher's --java-options to <install dir>\pgsql, so the
+        // bundled server is found even though it does not live under Program
+        // Files\PostgreSQL — the one location the scan below knows to look in. Absent
+        // (dev run via run.ps1, or a build that predates packaging) this is simply blank
+        // and resolution falls through to the scan unchanged.
+        String bundled = System.getProperty("rps.pgsql.home");
+        if (bundled != null && !bundled.isBlank()) {
+            Path p = Path.of(bundled, "bin", "pg_dump.exe");
             if (Files.isRegularFile(p)) return Optional.of(p);
         }
 

@@ -28,7 +28,7 @@ final class OrderDetailDialog extends JDialog {
         headerRow.setOpaque(false);
         headerRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         headerRow.add(UiFactory.title(order.orderNumber()), BorderLayout.WEST);
-        headerRow.add(UiFactory.statusPill(order.status()), BorderLayout.EAST);
+        headerRow.add(statusPills(order), BorderLayout.EAST);
         content.add(headerRow);
         content.add(Box.createVerticalStrut(4));
         content.add(line(order.type().label() + "  ·  " + order.createdAt().format(TS) + "  ·  Staff: " + order.staffName()));
@@ -53,15 +53,26 @@ final class OrderDetailDialog extends JDialog {
         content.add(Box.createVerticalStrut(10));
 
         for (OrderLine l : order.lines()) {
-            JPanel row = new JPanel(new BorderLayout());
+            // Name in CENTER, price in EAST. BorderLayout gives EAST its preferred width
+            // and hands CENTER whatever is left, and a JLabel narrower than its text
+            // ellipsises itself — so the name can never run into the price. It previously
+            // sat in WEST and was cut to a fixed 44 CHARACTERS, but the font is
+            // proportional, so a wide name still measured past the price and overlapped it
+            // ("...+ 2 ReRs. 1,450.00"). Letting the layout measure in pixels removes the
+            // guesswork entirely.
+            JPanel row = new JPanel(new BorderLayout(10, 0));
             row.setOpaque(false);
             row.setAlignmentX(Component.LEFT_ALIGNMENT);
             row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 26));
             String fullName = l.quantity() + "x " + l.displayName();
-            JLabel nameLabel = UiFactory.label(truncateName(fullName));
-            if (fullName.length() > 44) nameLabel.setToolTipText(fullName);
-            row.add(nameLabel, BorderLayout.WEST);
-            row.add(UiFactory.label(l.lineTotal().format()), BorderLayout.EAST);
+            JLabel nameLabel = UiFactory.label(fullName);
+            nameLabel.setToolTipText(fullName);
+            JLabel priceLabel = UiFactory.label(l.lineTotal().format());
+            // Without this the row's preferred width is name+price at full length, which
+            // would widen the whole scrollable column rather than ellipsising.
+            nameLabel.setMinimumSize(new Dimension(0, nameLabel.getPreferredSize().height));
+            row.add(nameLabel, BorderLayout.CENTER);
+            row.add(priceLabel, BorderLayout.EAST);
             content.add(row);
             if (l.hasOption()) {
                 content.add(UiFactory.muted("   " + l.optionGroupName() + ": " + l.optionValueName()));
@@ -94,9 +105,19 @@ final class OrderDetailDialog extends JDialog {
 
         content.add(Box.createVerticalStrut(16));
         JButton close = UiFactory.secondaryButton("Close");
-        close.setAlignmentX(Component.CENTER_ALIGNMENT);
         close.addActionListener(e -> dispose());
-        content.add(close);
+        // Centred by wrapping, not by setAlignmentX on the button itself. BoxLayout
+        // resolves ONE alignment point across all its children, so a single centre-aligned
+        // child among left-aligned siblings gets allocated less than its own minimum
+        // width — measured at 76px against a 89px minimum, which is why this rendered as
+        // "C..." instead of "Close". A centred FlowLayout row keeps every direct child of
+        // the BoxLayout left-aligned, so nothing is squeezed.
+        JPanel closeRow = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        closeRow.setOpaque(false);
+        closeRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        closeRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, close.getPreferredSize().height));
+        closeRow.add(close);
+        content.add(closeRow);
 
         // Width-tracks the scroll pane viewport (see ScrollableColumn) so no child —
         // an unusually long line-item name, delivery address, or note — can force this
@@ -104,6 +125,7 @@ final class OrderDetailDialog extends JDialog {
         ScrollableColumn outer = new ScrollableColumn(new BorderLayout());
         outer.setBackground(Theme.BACKGROUND);
         outer.setBorder(BorderFactory.createEmptyBorder(Theme.SPACE_MD, Theme.SPACE_MD, Theme.SPACE_MD, Theme.SPACE_MD));
+        TouchScroll.install(outer);
         outer.add(content, BorderLayout.CENTER);
 
         JScrollPane scroll = new JScrollPane(outer,
@@ -125,6 +147,18 @@ final class OrderDetailDialog extends JDialog {
      *  every right-anchored total and the status pill off past the visible edge. */
     private static final int CONTENT_WIDTH_PX = 320;
 
+    /** One pill: the payment state, unless the order is cancelled — in which case that
+     *  overrides it, same rule as the Dashboard's single Status column. Fulfilment is
+     *  otherwise not shown here; it isn't something the counter reads day to day. */
+    private static JComponent statusPills(Order order) {
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
+        row.setOpaque(false);
+        row.add(order.fulfilmentStatus().isCancelled()
+            ? UiFactory.fulfilmentPill(order.fulfilmentStatus())
+            : UiFactory.statusPill(order.paymentStatus()));
+        return row;
+    }
+
     private static JLabel line(String text) {
         JLabel l = UiFactory.muted("<html><div style='width:" + CONTENT_WIDTH_PX + "px'>"
             + escapeHtml(text) + "</div></html>");
@@ -134,19 +168,6 @@ final class OrderDetailDialog extends JDialog {
 
     private static String escapeHtml(String s) {
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
-    }
-
-    /** Mirrors PosPanel's tileDisplayName — a long deal name (which carries its full
-     *  contents in the name itself, e.g. "Heavy Deal: 2 Chicken Burger + ...") is cut
-     *  to something that fits one row, with the full text as a tooltip. Keeping this a
-     *  single line (rather than wrapping like line()) is deliberate: a line-item row
-     *  is a BorderLayout WEST/EAST pair with the price on the right, and a wrapped
-     *  multi-line WEST label would run underneath — or push out — that price. */
-    private static String truncateName(String name) {
-        if (name.length() <= 44) return name;
-        int cut = name.lastIndexOf(' ', 41);
-        if (cut < 15) cut = 41;
-        return name.substring(0, cut).stripTrailing() + "…";
     }
 
     private static JComponent divider() {

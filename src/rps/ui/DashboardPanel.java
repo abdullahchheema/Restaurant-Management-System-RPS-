@@ -5,7 +5,8 @@ import rps.db.Db;
 import rps.db.DatabaseException;
 import rps.db.OrderDao;
 import rps.model.Order;
-import rps.model.OrderStatus;
+import rps.model.FulfilmentStatus;
+import rps.model.PaymentStatus;
 import rps.model.OrderType;
 import rps.print.ReceiptPrinter;
 import rps.ui.icon.LineIcon;
@@ -37,6 +38,12 @@ public final class DashboardPanel extends JPanel {
     private static final int POLL_MS = 4000;
 
     private static final int COL_TOTAL = 4;
+    // One column for both tracks: shows the payment pill (Unpaid/Partially Paid/Paid),
+    // or a Cancelled pill overriding that when the order is cancelled — a customer only
+    // ever needs to know "is this order still live, and if so has it been paid", and a
+    // separate always-visible Pending/Completed indicator was more than the counter
+    // actually uses day to day. Clicking it still reaches every action (Record Payment,
+    // Cancel/Force Cancel) — see showStatusMenu.
     private static final int COL_STATUS = 5;
     private static final int COL_ACTION = 7;
 
@@ -99,8 +106,11 @@ public final class DashboardPanel extends JPanel {
     }
 
     private final JComboBox<String> typeFilter = new JComboBox<>(new String[]{"All", "Dine-in", "Takeaway", "Delivery"});
+    // One filter for the one column now shown: three payment states plus Cancelled,
+    // which is a fulfilment state but sits in the same list here since it's what that
+    // column's "Cancelled" pill corresponds to — see OrdersTableModel#getValueAt.
     private final JComboBox<String> statusFilter = new JComboBox<>(
-        new String[]{"All", "Pending", "Partially Paid", "Payment Received", "Cancelled"});
+        new String[]{"All", "Unpaid", "Partially Paid", "Paid", "Cancelled"});
     private final DateRangePicker dateRangePicker =
         new DateRangePicker(OrderDao.businessDate(ZonedDateTime.now()), OrderDao.businessDate(ZonedDateTime.now()));
 
@@ -160,7 +170,7 @@ public final class DashboardPanel extends JPanel {
         filterRow.setOpaque(false);
         filterRow.setAlignmentX(Component.LEFT_ALIGNMENT);
         filterRow.add(labeledFilter("Order Type", typeFilter));
-        filterRow.add(labeledFilter("Order Status", statusFilter));
+        filterRow.add(labeledFilter("Status", statusFilter));
         filterRow.add(labeledFilter("Date Range", dateRangePicker));
 
         // Both combos refresh immediately on change — the date range already applies
@@ -269,6 +279,7 @@ public final class DashboardPanel extends JPanel {
         // doesn't override getColumnClass) except Status and Action, whose per-column
         // renderers below take precedence over this default.
         t.setDefaultRenderer(Object.class, UiFactory.centeredCellRenderer());
+        t.getColumnModel().getColumn(0).setCellRenderer(orderNumberCellRenderer());
         t.getColumnModel().getColumn(COL_STATUS).setCellRenderer(UiFactory.statusPillCellRenderer());
         t.getColumnModel().getColumn(COL_TOTAL).setCellRenderer(payableCellRenderer());
 
@@ -276,9 +287,9 @@ public final class DashboardPanel extends JPanel {
         // 75px — at split-pane width (roughly half the window) eight equal columns left
         // "Order #" and "Staff" too narrow to show their own text, and the unconstrained
         // Edit button column got squeezed below what "Edit" needs to render, both
-        // clipping to an ellipsis. Order # / Status get the most room; Time / Items stay
-        // tight. These are top-level requests, not guesses.
-        setColumnWidth(t, 0, 92, 70);   // Order #
+        // clipping to an ellipsis. Status gets the most room; Time / Items stay tight.
+        // These are top-level requests, not guesses.
+        setColumnWidth(t, 0, 68, 56);   // Order # (day sequence only, e.g. "007")
         setColumnWidth(t, 1, 56, 50);   // Time
         setColumnWidth(t, 2, 72, 60);   // Type
         setColumnWidth(t, 3, 48, 40);   // Items
@@ -302,21 +313,23 @@ public final class DashboardPanel extends JPanel {
         //   - anything else -> opens the read-only detail view
         // Right-click also delivers a mouseClicked on some platforms, so this ignores
         // anything but the primary button to avoid opening details underneath the
-        // context menu it's about to show.
-        t.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                if (!SwingUtilities.isLeftMouseButton(e)) return;
-                int row = t.rowAtPoint(e.getPoint());
-                int col = t.columnAtPoint(e.getPoint());
-                if (row < 0) return;
-                Order order = model.orderAt(row);
-                if (col == COL_STATUS) {
-                    showStatusMenu(order, t, e.getPoint());
-                } else if (col == COL_TOTAL && order.status().awaitsPayment()) {
-                    recordPaymentFor(order);
-                } else if (col != COL_ACTION) {
-                    showOrderDetail(order.id());
-                }
+        // context menu it's about to show. Wired through TouchScroll rather than a plain
+        // click listener: the till is touchscreen, and a finger swiping down the table to
+        // scroll it (very likely to start ON a row, which is most of the table) must not
+        // also open whatever row it started on — a movement past the drag threshold pans
+        // the table instead of firing this tap action.
+        TouchScroll.install(t, (MouseEvent e) -> {
+            if (!SwingUtilities.isLeftMouseButton(e)) return;
+            int row = t.rowAtPoint(e.getPoint());
+            int col = t.columnAtPoint(e.getPoint());
+            if (row < 0) return;
+            Order order = model.orderAt(row);
+            if (col == COL_STATUS) {
+                showStatusMenu(order, t, e.getPoint());
+            } else if (col == COL_TOTAL && order.owesMoney()) {
+                recordPaymentFor(order);
+            } else if (col != COL_ACTION) {
+                showOrderDetail(order.id());
             }
         });
 
@@ -371,6 +384,23 @@ public final class DashboardPanel extends JPanel {
         c.setMinWidth(min);
     }
 
+    /** Order # column: shows only the day's sequence number (see
+     *  OrdersTableModel#displayOrderNumber), but a tooltip carries the real, full
+     *  order number — needed the moment a date range spans more than one day, since
+     *  "007" alone is then ambiguous between two different orders. */
+    private static TableCellRenderer orderNumberCellRenderer() {
+        return (table, value, isSelected, hasFocus, row, column) -> {
+            Order order = ((OrdersTableModel) table.getModel()).orderAt(row);
+            JLabel l = new JLabel(String.valueOf(value), SwingConstants.CENTER);
+            l.setFont(Theme.FONT_BODY);
+            l.setOpaque(true);
+            l.setBackground(isSelected ? table.getSelectionBackground() : table.getBackground());
+            l.setForeground(Theme.TEXT);
+            l.setToolTipText(order.orderNumber());
+            return l;
+        };
+    }
+
     /** Total column: plain centered text for a settled order, but a bordered "chip"
      *  look for a Pending order — a visual cue that this specific cell (unlike the rest
      *  of the row) responds to a click by prompting for a payment. */
@@ -381,7 +411,7 @@ public final class DashboardPanel extends JPanel {
             l.setFont(Theme.FONT_BODY);
             l.setOpaque(true);
             l.setBackground(isSelected ? table.getSelectionBackground() : table.getBackground());
-            if (order.status().awaitsPayment()) {
+            if (order.owesMoney()) {
                 l.setForeground(Theme.STATUS_PENDING);
                 l.setBorder(BorderFactory.createCompoundBorder(
                     BorderFactory.createLineBorder(Theme.STATUS_PENDING, 1, true),
@@ -410,8 +440,19 @@ public final class DashboardPanel extends JPanel {
         return b;
     }
 
+    /** "Edit" while the order is still fully editable, "Add" once the edit window has
+     *  closed and only new items can go on it — so the button says what it will actually
+     *  let you do before it is clicked, rather than opening a dialog that turns out to be
+     *  half locked. */
     private static TableCellRenderer editButtonRenderer() {
-        return (table, value, isSelected, hasFocus, row, column) -> compactTableButton("Edit");
+        return (table, value, isSelected, hasFocus, row, column) -> {
+            JButton b = compactTableButton(String.valueOf(value));
+            Order order = ((OrdersTableModel) table.getModel()).orderAt(row);
+            b.setToolTipText(OrderDao.canEdit(order)
+                ? "Edit this order"
+                : "The edit window has passed — you can still add more items");
+            return b;
+        };
     }
 
     private TableCellEditor editButtonEditor(OrdersTableModel model) {
@@ -438,30 +479,51 @@ public final class DashboardPanel extends JPanel {
         @Override
         public Component getTableCellEditorComponent(JTable table, Object value, boolean isSelected, int row, int column) {
             currentOrder = model.orderAt(row);
+            button.setText(String.valueOf(value));
             return button;
         }
 
         @Override
         public Object getCellEditorValue() {
-            return "Edit";
+            return currentOrder == null || OrderDao.canEdit(currentOrder) ? "Edit" : "Add";
         }
     }
 
-    /** Cancel / Record Payment — the same actions the right-click menu used to carry,
-     *  now reachable with one click on the status pill itself since that is the field
-     *  that's actually changing. */
+    /** Every action the single Status/Payment pill can reach. "Mark Completed" is
+     *  deliberately not offered here: fulfilment is no longer shown anywhere in this
+     *  table (a live order just shows its payment state), so there is nothing on screen
+     *  for that action to visibly change — the fulfilment column still exists in the
+     *  data and still drives revenue exclusion once an order is cancelled, it is just
+     *  not something the counter sets by hand any more. */
     private void showStatusMenu(Order order, Component invoker, Point p) {
         JPopupMenu menu = new JPopupMenu();
-        if (order.status().awaitsPayment()) {
+        if (order.owesMoney()) {
             JMenuItem recordPayment = new JMenuItem("Record Payment…");
             recordPayment.addActionListener(e -> recordPaymentFor(order));
             menu.add(recordPayment);
+
+            JMenuItem payLater = new JMenuItem("Move to Pay Later…");
+            payLater.addActionListener(e -> moveToLoan(order));
+            menu.add(payLater);
         }
-        if (order.status().canCancel()) {
-            JMenuItem cancel = new JMenuItem("Cancel Order");
-            cancel.addActionListener(e -> cancelOrder(order));
-            menu.add(cancel);
+        if (order.fulfilmentStatus().isLive()) {
+            // Inside the window this is the ordinary action; past it the same operation is
+            // still possible but is deliberately relabelled, so nobody voids an hours-old
+            // order believing it to be routine.
+            if (OrderDao.withinCancelWindow(order)) {
+                JMenuItem cancel = new JMenuItem("Cancel Order");
+                cancel.addActionListener(e -> cancelOrder(order, false));
+                menu.add(cancel);
+            } else {
+                JMenuItem force = new JMenuItem("Force Cancel…");
+                force.addActionListener(e -> cancelOrder(order, true));
+                menu.add(force);
+            }
         }
+        showOrNoActions(menu, invoker, p);
+    }
+
+    private static void showOrNoActions(JPopupMenu menu, Component invoker, Point p) {
         if (menu.getComponentCount() == 0) {
             JMenuItem none = new JMenuItem("No actions available");
             none.setEnabled(false);
@@ -493,14 +555,19 @@ public final class DashboardPanel extends JPanel {
             case "Delivery" -> OrderType.DELIVERY;
             default -> null;
         };
-        OrderStatus status = switch ((String) statusFilter.getSelectedItem()) {
-            case "Pending" -> OrderStatus.PENDING;
-            case "Partially Paid" -> OrderStatus.PARTIALLY_PAID;
-            case "Payment Received" -> OrderStatus.PAYMENT_RECEIVED;
-            case "Cancelled" -> OrderStatus.CANCELLED;
+        // "Cancelled" sets the fulfilment half of the filter; the three payment options
+        // set the payment half — never both at once, since the single visible column
+        // shows one or the other for any given row (see OrdersTableModel#getValueAt).
+        String selected = (String) statusFilter.getSelectedItem();
+        FulfilmentStatus fulfilment = "Cancelled".equals(selected) ? FulfilmentStatus.CANCELLED : null;
+        PaymentStatus payment = switch (selected) {
+            case "Unpaid" -> PaymentStatus.UNPAID;
+            case "Partially Paid" -> PaymentStatus.PARTIALLY_PAID;
+            case "Paid" -> PaymentStatus.PAID;
             default -> null;
         };
-        return new OrderDao.OrderFilter(type, status, dateRangePicker.from(), dateRangePicker.to());
+        return new OrderDao.OrderFilter(type, payment, fulfilment,
+            dateRangePicker.from(), dateRangePicker.to());
     }
 
     private void refresh(boolean force) {
@@ -565,12 +632,12 @@ public final class DashboardPanel extends JPanel {
             return;
         }
 
-        boolean statusFilterIsAll = filter.status() == null;
+        boolean statusFilterIsAll = filter.paymentStatus() == null && filter.fulfilmentStatus() == null;
         if (statusFilterIsAll) {
             List<OrderDao.OrderRow> pending = new ArrayList<>();
             List<OrderDao.OrderRow> settled = new ArrayList<>();
             for (OrderDao.OrderRow r : orders) {
-                (r.order().status().awaitsPayment() ? pending : settled).add(r);
+                (r.order().owesMoney() ? pending : settled).add(r);
             }
             if (pending.isEmpty()) {
                 allModel.setOrders(orders);
@@ -590,7 +657,8 @@ public final class DashboardPanel extends JPanel {
 
     private void updateEmptyState(OrderDao.OrderFilter filter) {
         LocalDate today = OrderDao.businessDate(ZonedDateTime.now());
-        boolean isDefaultFilter = filter.type() == null && filter.status() == null
+        boolean isDefaultFilter = filter.type() == null && filter.paymentStatus() == null
+            && filter.fulfilmentStatus() == null
             && filter.from().equals(today) && filter.to().equals(today);
         if (isDefaultFilter) {
             emptyState.setMessage("No orders yet today", "New orders will appear here as they come in.");
@@ -600,16 +668,33 @@ public final class DashboardPanel extends JPanel {
         centerCards.show(centerHolder, CARD_EMPTY);
     }
 
-    private void cancelOrder(Order order) {
-        if (!order.status().canCancel()) {
-            JOptionPane.showMessageDialog(this, "This order can no longer be cancelled.");
+    private void cancelOrder(Order order, boolean force) {
+        if (order.fulfilmentStatus().isCancelled()) {
+            JOptionPane.showMessageDialog(this, "This order is already cancelled.");
             return;
         }
-        int confirm = JOptionPane.showConfirmDialog(this,
-            "Cancel order " + order.orderNumber() + "?", "Confirm", JOptionPane.YES_NO_OPTION);
+        // Spelled out rather than a bare "are you sure": cancelling now DELETES the order
+        // outright (see OrderDao#cancelOrder) rather than marking it Cancelled and keeping
+        // the row, so this is the one chance to stop before the order and its full detail
+        // are gone for good — no audit trail, nothing to undo from the Dashboard afterward.
+        String paidWarning = order.paymentStatus().isPaid()
+            ? "It has been PAID (" + order.totals().amountPaid().format()
+              + ") — cancelling takes that back out of today's takings, so the money must be refunded.\n\n"
+            : "";
+        String deleteWarning = "This permanently deletes order " + order.orderNumber()
+            + " and everything on it — this cannot be undone.\n\n";
+        String prompt = force
+            ? "Order " + order.orderNumber() + " is past the "
+                + rps.util.AppSettings.get().orderCancelWindowMinutes()
+                + "-minute cancellation window.\n\n" + paidWarning + deleteWarning + "Force cancel it anyway?"
+            : deleteWarning + paidWarning + "Cancel order " + order.orderNumber() + "?";
+        int confirm = JOptionPane.showConfirmDialog(this, prompt,
+            force ? "Force Cancel" : "Confirm", JOptionPane.YES_NO_OPTION,
+            force ? JOptionPane.WARNING_MESSAGE : JOptionPane.QUESTION_MESSAGE);
         if (confirm != JOptionPane.YES_OPTION) return;
         try {
-            boolean ok = orderDao.updateStatus(order.id(), order.status(), OrderStatus.CANCELLED, session.staffId());
+            boolean ok = orderDao.updateFulfilment(order.id(), order.fulfilmentStatus(),
+                FulfilmentStatus.CANCELLED, session.staffId(), force);
             if (!ok) {
                 JOptionPane.showMessageDialog(this,
                     "This order was already updated by another terminal. Refreshing.",
@@ -622,16 +707,32 @@ public final class DashboardPanel extends JPanel {
     }
 
     private void recordPaymentFor(Order order) {
-        if (!order.status().awaitsPayment()) {
+        if (!order.owesMoney()) {
             JOptionPane.showMessageDialog(this,
                 "This order is already settled or cancelled — no payment can be recorded against it.");
             return;
         }
-        String input = JOptionPane.showInputDialog(this,
-            "Balance due: " + order.totals().balanceDue().format() + "\nAmount received:",
-            "Record Payment", JOptionPane.PLAIN_MESSAGE);
-        if (input == null || input.isBlank()) return;
-        Money amount = Validators.parsePrice(input);
+        Money balanceDue = order.totals().balanceDue();
+        JTextField amountField = UiFactory.textField(10);
+        // A shortcut for the common case — the customer paid exactly what's owed — so
+        // the cashier doesn't have to retype the balance-due figure already shown right
+        // above and risk a typo. It only fills the field; Record/OK still has to be
+        // clicked, same as typing the amount by hand would.
+        JButton fullPaymentBtn = UiFactory.secondaryButton("Full Payment Received");
+        fullPaymentBtn.addActionListener(e -> {
+            amountField.setText(balanceDue.asBigDecimal().toPlainString());
+            amountField.requestFocusInWindow();
+        });
+        JPanel amountRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        amountRow.setOpaque(false);
+        amountRow.add(amountField);
+        amountRow.add(fullPaymentBtn);
+
+        int choice = JOptionPane.showConfirmDialog(this,
+            new Object[]{"Balance due: " + balanceDue.format(), "Amount received:", amountRow},
+            "Record Payment", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) return;
+        Money amount = Validators.parsePrice(amountField.getText());
         if (amount == null || !amount.isPositive()) {
             JOptionPane.showMessageDialog(this, "Enter a valid amount greater than zero.", "Error", JOptionPane.ERROR_MESSAGE);
             return;
@@ -652,10 +753,40 @@ public final class DashboardPanel extends JPanel {
         }
     }
 
+    /** Hands the order over to the Pay Later ledger. Spelled out rather than confirmed with
+     *  a bare "are you sure" because it has two consequences a cashier should not discover
+     *  afterwards: the order leaves this screen entirely, and its total starts counting as
+     *  revenue despite the cash not having arrived. */
+    private void moveToLoan(Order order) {
+        Money balance = order.totals().balanceDue();
+        int confirm = JOptionPane.showConfirmDialog(this,
+            "Put order " + order.orderNumber() + " on account (pay later)?\n\n"
+                + "Still owed: " + balance.format() + "\n\n"
+                + "It will move off the Dashboard into the Pay Later tab, where the balance\n"
+                + "stays on record until the customer settles it. Its total counts as revenue\n"
+                + "from now on, and it stops showing as outstanding.",
+            "Move to Pay Later", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (confirm != JOptionPane.YES_OPTION) return;
+        try {
+            if (!orderDao.moveToLoan(order.id(), session.staffId())) {
+                JOptionPane.showMessageDialog(this,
+                    "This order was already updated by another terminal. Refreshing.",
+                    "Out of date", JOptionPane.WARNING_MESSAGE);
+            }
+            refresh(true);
+        } catch (DatabaseException e) {
+            JOptionPane.showMessageDialog(this, e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
+    }
+
     private void editOrder(Order order) {
         if (order == null) return;
-        if (!OrderDao.canEdit(order)) {
-            JOptionPane.showMessageDialog(this, "This order can no longer be edited.");
+        // Past the edit window the dialog still opens — in add-only mode, where the placed
+        // items are frozen but more can be ordered (OrderEditDialog / OrderDao.canAddItems).
+        // Only a cancelled order has nothing left to do here at all.
+        if (!OrderDao.canAddItems(order)) {
+            JOptionPane.showMessageDialog(this,
+                "This order was cancelled — it can no longer be edited or added to.");
             return;
         }
         Busy.call(this, () -> orderDao.loadOrderForPrint(order.id()))
@@ -708,19 +839,39 @@ public final class DashboardPanel extends JPanel {
             return col == COL_ACTION;
         }
 
+        /** "20260918-007" -> "007". Order numbers are always DATE-SEQ (OrderDao#saveOrder),
+         *  so the sequence is everything after the last hyphen; anything that doesn't
+         *  match that shape (there is no such case today, but this is display code, not
+         *  a parser the rest of the app depends on) is shown unchanged rather than
+         *  guessing at a substring. */
+        private static String displayOrderNumber(String orderNumber) {
+            int dash = orderNumber.lastIndexOf('-');
+            return dash < 0 || dash == orderNumber.length() - 1 ? orderNumber : orderNumber.substring(dash + 1);
+        }
+
         @Override
         public Object getValueAt(int row, int col) {
             OrderDao.OrderRow r = rows.get(row);
             Order o = r.order();
             return switch (col) {
-                case 0 -> o.orderNumber();
+                // Only the day's own sequence number, not the yyyyMMdd- prefix — the
+                // dashboard is always looking at a chosen date range already (shown by
+                // the date picker itself), so repeating that date on every single row
+                // added nothing a cashier actually reads at a glance. The real, full
+                // order number (needed for a receipt reprint, a refund conversation,
+                // anything that leaves this screen) is untouched everywhere else — the
+                // detail view, receipts, CSV export, the database — this is display-only.
+                case 0 -> displayOrderNumber(o.orderNumber());
                 case 1 -> o.createdAt().format(TS);
                 case 2 -> o.type().label();
                 case 3 -> r.itemCount();
                 case 4 -> o.totals().total().format();
-                case 5 -> o.status();
+                // A cancelled order shows as Cancelled regardless of its payment state —
+                // that overrides Paid/Unpaid here rather than needing its own column, but
+                // the fulfilment status is not otherwise surfaced anywhere in this table.
+                case COL_STATUS -> o.fulfilmentStatus().isCancelled() ? o.fulfilmentStatus() : o.paymentStatus();
                 case 6 -> o.staffName();
-                case COL_ACTION -> "Edit";
+                case COL_ACTION -> OrderDao.canEdit(o) ? "Edit" : "Add";
                 default -> "";
             };
         }

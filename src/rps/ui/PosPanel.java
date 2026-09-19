@@ -21,9 +21,13 @@ import rps.util.Money;
 import rps.util.Validators;
 
 import javax.swing.*;
+import javax.swing.border.Border;
 import java.awt.*;
+import java.awt.geom.RoundRectangle2D;
 import java.math.BigDecimal;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public final class PosPanel extends JPanel {
@@ -39,15 +43,16 @@ public final class PosPanel extends JPanel {
 
     private final OrderDraft draft = new OrderDraft();
 
-    // Plain FlowLayout reports a single row's preferred height no matter how many
-    // children it has, so with more than a row's worth of categories the overflow was
-    // clipped rather than wrapped — WrapLayout (already used by the item tile grid)
-    // recomputes its preferred height for the width it's actually given.
-    private final JPanel categoryStrip = new JPanel(new WrapLayout(FlowLayout.LEFT, 8, 8));
+    // A single scrollable row of underline text tabs (see categoryTab) with arrow
+    // buttons either side — matches a POS category strip rather than the wrapping pill
+    // chips this used to be; with up to ~17 categories, one scrollable row reads far
+    // closer to a real till than several rows of chips ever did.
+    private final JPanel categoryStrip = new JPanel();
+    private final JScrollPane categoryScrollPane = new JScrollPane(categoryStrip,
+        ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
     private final JTextField menuSearchField = UiFactory.textField(18);
-    private final WrapPanel tileGrid = new WrapPanel(new WrapLayout(FlowLayout.LEFT, 12, 12));
+    private final WrapPanel tileGrid = new WrapPanel(new WrapLayout(FlowLayout.LEFT, 14, 14));
     private final JPanel ticketList = new JPanel();
-    private final JLabel totalLabel = titleLabelInPrimary();
     private final JLabel fieldsError = UiFactory.errorText(" ");
 
     private final JTextField tableField = UiFactory.textField(8);
@@ -55,6 +60,11 @@ public final class PosPanel extends JPanel {
     private final JTextField phoneField = UiFactory.textField(16);
     private final JLabel phoneLabel = UiFactory.muted("Phone number *");
     private final JComponent phoneRow = labeledFieldWithLabel(phoneLabel, phoneField);
+    /** Unticked by default — the ordinary phone requirement for Takeaway/Delivery still
+     *  applies unless the cashier explicitly ticks this for a customer who won't give a
+     *  number. Lives directly under the phone field, since it only makes sense in
+     *  relation to it. */
+    private final JCheckBox noPhoneCheck = new JCheckBox("No phone number");
     private final JTextField addressField = UiFactory.textField(24);
     private final JComponent addressRow = labeledField("Delivery address *", addressField);
     private final JLabel deliveryFeeLabel = UiFactory.muted(" ");
@@ -72,13 +82,15 @@ public final class PosPanel extends JPanel {
     private final JTextField cashTenderedField = UiFactory.textField(10);
     private final JLabel changeDueLabel = UiFactory.labelBold(" ");
 
-    private final JButton confirmButton = confirmButtonStyled();
+    /** The bottom action bar: a single burgundy bar carrying both the confirm action and
+     *  the running total, in place of a separate "Total" row + Confirm button. */
+    private final PayBar payBar = new PayBar();
     /** True from the moment Confirm is clicked until the save resolves. Confirm is
      *  re-enabled by updateConfirmEnabled(), which is reached from refreshTicket() /
      *  refreshTotals() / validateFields() — so merely disabling the button in the click
      *  handler was not enough: adding a ticket line during the save re-enabled it and a
      *  second click submitted the same order again (reproduced against the real panel).
-     *  This flag is the authoritative gate; the button state is derived from it. */
+     *  This flag is the authoritative gate; the bar's clickable state is derived from it. */
     private boolean submitting = false;
     private final JLabel emptyTicketLabel = emptyStateLabel();
 
@@ -96,6 +108,14 @@ public final class PosPanel extends JPanel {
     private final Timer menuPollTimer = new Timer(MENU_POLL_MS, e -> pollMenu());
     private final AtomicBoolean menuPollInFlight = new AtomicBoolean(false);
     private String lastMenuFingerprint = "";
+
+    // Decoded tile icons, keyed by menu item id. Kept across category switches and
+    // searches (rebuildTileGrid runs on every one of those, and re-fetching a photo's
+    // bytes from the database on every click would be a needless round trip) but wiped
+    // in applyReloadedMenu — the one place both the initial load and a poll-detected
+    // catalog change funnel through — so a manager who just changed an item's photo in
+    // the Menu tab sees the new one here without restarting the app.
+    private final Map<Integer, ImageIcon> tileImageCache = new HashMap<>();
 
     public PosPanel(Db db, Session session, OffsiteBackupService backupService) {
         this.db = db;
@@ -177,27 +197,27 @@ public final class PosPanel extends JPanel {
         top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
 
         menuSearchField.putClientProperty("JTextField.placeholderText", "Search menu…");
+        menuSearchField.putClientProperty("JTextField.leadingIcon",
+            rps.ui.icon.LineIcon.SEARCH.of(16, Theme.TEXT_MUTED));
         menuSearchField.getDocument().addDocumentListener((SimpleDocListener) () -> {
             searchQuery = menuSearchField.getText().trim().toLowerCase(java.util.Locale.ROOT);
             rebuildTileGrid();
         });
-        // A heading on the left balances the search field on the right — previously
-        // this row was empty apart from the field, which read as a large dead strip of
-        // whitespace rather than an intentional header.
-        JPanel searchRow = new JPanel(new BorderLayout(12, 0));
+        JPanel searchRow = new JPanel(new BorderLayout());
         searchRow.setOpaque(false);
         searchRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-        searchRow.add(UiFactory.heading("Menu"), BorderLayout.WEST);
-        searchRow.add(menuSearchField, BorderLayout.EAST);
+        searchRow.add(menuSearchField, BorderLayout.CENTER);
         top.add(searchRow);
-        top.add(Box.createVerticalStrut(12));
+        top.add(Box.createVerticalStrut(14));
 
-        categoryStrip.setOpaque(false);
-        categoryStrip.setAlignmentX(Component.LEFT_ALIGNMENT);
-        top.add(categoryStrip);
+        top.add(buildCategoryRow());
         left.add(top, BorderLayout.NORTH);
 
         tileGrid.setOpaque(false);
+        // Covers the gaps between tiles — each tile handles its own drag/tap (buildTile),
+        // but the WrapLayout gaps and any margin beyond the last tile belong to tileGrid
+        // itself and would otherwise be a dead patch a swipe can't start from.
+        TouchScroll.install(tileGrid);
         JScrollPane scroll = new JScrollPane(tileGrid,
             ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
         scroll.setBorder(null);
@@ -206,6 +226,50 @@ public final class PosPanel extends JPanel {
         left.add(scroll, BorderLayout.CENTER);
 
         return left;
+    }
+
+    /** Left/right arrows either side of a single-row, horizontally scrolling category
+     *  strip — a shop with ~17 categories cannot fit them all in one screen width, and a
+     *  scrollable row with explicit arrows reads as a considered POS category rail rather
+     *  than the wrapping multi-row pill grid this replaces. */
+    private JComponent buildCategoryRow() {
+        categoryStrip.setLayout(new BoxLayout(categoryStrip, BoxLayout.X_AXIS));
+        categoryStrip.setOpaque(false);
+        TouchScroll.install(categoryStrip);
+        categoryScrollPane.setBorder(null);
+        categoryScrollPane.setOpaque(false);
+        categoryScrollPane.getViewport().setOpaque(false);
+        categoryScrollPane.setPreferredSize(new Dimension(10, 42));
+        categoryScrollPane.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
+
+        JButton leftArrow = scrollArrowButton(rps.ui.icon.LineIcon.CHEVRON_LEFT);
+        JButton rightArrow = scrollArrowButton(rps.ui.icon.LineIcon.CHEVRON_RIGHT);
+        leftArrow.addActionListener(e -> scrollCategories(-160));
+        rightArrow.addActionListener(e -> scrollCategories(160));
+
+        JPanel row = new JPanel(new BorderLayout(4, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
+        row.add(leftArrow, BorderLayout.WEST);
+        row.add(categoryScrollPane, BorderLayout.CENTER);
+        row.add(rightArrow, BorderLayout.EAST);
+        return row;
+    }
+
+    private static JButton scrollArrowButton(rps.ui.icon.LineIcon icon) {
+        JButton b = new JButton(icon.of(13, Theme.TEXT_MUTED));
+        b.setFocusPainted(false);
+        b.setContentAreaFilled(false);
+        b.setBorderPainted(false);
+        b.setMargin(new Insets(6, 6, 6, 6));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        return b;
+    }
+
+    private void scrollCategories(int delta) {
+        JScrollBar bar = categoryScrollPane.getHorizontalScrollBar();
+        bar.setValue(bar.getValue() + delta);
     }
 
     private void reload() {
@@ -224,6 +288,7 @@ public final class PosPanel extends JPanel {
     private void applyReloadedMenu(List<Category> newCategories, List<MenuItem> newItems) {
         categories = newCategories;
         allItems = newItems;
+        tileImageCache.clear();
 
         Category stillSelected = null;
         if (activeCategory != null) {
@@ -245,17 +310,45 @@ public final class PosPanel extends JPanel {
         categoryStrip.removeAll();
         ButtonGroup group = new ButtonGroup();
         for (Category c : categories) {
-            JToggleButton btn = UiFactory.chipToggle(c.name(), c.equals(activeCategory), rps.ui.icon.LineIcon.forCategory(c.name()));
+            JToggleButton btn = categoryTab(c.name(), c.equals(activeCategory));
             btn.addActionListener(e -> {
                 activeCategory = c;
                 rebuildCategoryStrip();
                 rebuildTileGrid();
             });
+            // Tabs span nearly the entire visible strip (there is almost no bare gap
+            // between them), so a horizontal swipe to scroll categories is overwhelmingly
+            // likely to start ON a tab. A JToggleButton fires its own ActionListener
+            // through its own ButtonModel, which a plain added-on listener can't gate the
+            // way TouchScroll.install(..., onTap) gates a raw click — installOnButton
+            // disarms the button's model directly the instant a drag is detected instead.
+            TouchScroll.installOnButton(btn);
             group.add(btn);
             categoryStrip.add(btn);
         }
         categoryStrip.revalidate();
         categoryStrip.repaint();
+    }
+
+    /** Plain text tab with a bottom underline when selected — replaces the pill-chip look
+     *  category selectors use elsewhere in the app, matching a POS category rail instead. */
+    private static JToggleButton categoryTab(String text, boolean selected) {
+        JToggleButton b = new JToggleButton(text);
+        b.setSelected(selected);
+        b.setFont(selected ? Theme.FONT_BODY_BOLD : Theme.FONT_BODY);
+        b.setForeground(selected ? Theme.PRIMARY : Theme.TEXT_MUTED);
+        b.setOpaque(false);
+        b.setContentAreaFilled(false);
+        b.setFocusPainted(false);
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        // The underline sits at the very bottom edge (outer border) with padding inside
+        // it around the text — reserved even when unselected (same color as the strip's
+        // own background) so a tab's width never shifts by 3px the moment it's picked.
+        Border underline = BorderFactory.createMatteBorder(0, 0, 3, 0,
+            selected ? Theme.PRIMARY : Theme.BACKGROUND);
+        b.setBorder(BorderFactory.createCompoundBorder(underline,
+            BorderFactory.createEmptyBorder(8, 12, 5, 12)));
+        return b;
     }
 
     private void rebuildTileGrid() {
@@ -274,19 +367,32 @@ public final class PosPanel extends JPanel {
         tileGrid.repaint();
     }
 
+    /** Tile geometry, shared between the tile's own size and the exact box a cover-cropped
+     *  photo is rendered at — the tile is a fixed size (WrapLayout needs one to lay the
+     *  grid out), so the photo can be sized once, up front, rather than resized per-layout. */
+    private static final int TILE_WIDTH = 182;
+    private static final int TILE_IMAGE_HEIGHT = 108;
+
     private JComponent buildTile(MenuItem item) {
-        JPanel tile = new JPanel(new BorderLayout(4, 4));
-        tile.setPreferredSize(new Dimension(196, 150));
+        RoundedPanel tile = new RoundedPanel(new BorderLayout());
+        tile.setPreferredSize(new Dimension(TILE_WIDTH, TILE_IMAGE_HEIGHT + 78));
         tile.setBackground(Theme.SURFACE);
-        tile.setBorder(UiFactory.tileBorder(Theme.BORDER));
+        tile.setBorder(BorderFactory.createLineBorder(Theme.BORDER, 1, true));
         tile.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
 
+        JComponent image = buildTileImageArea(item);
+        tile.add(image, BorderLayout.NORTH);
+
         // Deal names carry their full contents (e.g. "Heavy Deal: 2 Chicken Burger + ...")
-        // so the kitchen ticket and receipt — which print whatever the item's name is —
-        // show exactly what's included with no separate schema for bundle contents. That
-        // makes some names too long for this fixed-height tile, so the tile itself shows
-        // a shortened form with the full text as a tooltip; the order always uses the
-        // real item, never the truncated label.
+        // so the kitchen ticket — which prints whatever the item's name is — shows exactly
+        // what's included with no separate schema for bundle contents. That makes some
+        // names too long for this fixed-height tile, so the tile itself shows a shortened
+        // form with the full text as a tooltip; the order always uses the real item, never
+        // the truncated label.
+        JPanel nameWrap = new JPanel(new BorderLayout());
+        nameWrap.setOpaque(true);
+        nameWrap.setBackground(Theme.SURFACE);
+        nameWrap.setBorder(BorderFactory.createEmptyBorder(9, 11, 6, 11));
         JLabel name = new JLabel("<html>" + escape(tileDisplayName(item.name())) + "</html>");
         name.setFont(Theme.FONT_BODY_BOLD);
         name.setForeground(Theme.TEXT);
@@ -295,48 +401,122 @@ public final class PosPanel extends JPanel {
             name.setToolTipText(escape(item.name()));
             tile.setToolTipText(escape(item.name()));
         }
-        tile.add(name, BorderLayout.NORTH);
+        nameWrap.add(name, BorderLayout.CENTER);
+        tile.add(nameWrap, BorderLayout.CENTER);
 
-        TileBadge badge = new TileBadge(categoryNameFor(item), 64);
-        JPanel badgeWrap = new JPanel(new BorderLayout());
-        badgeWrap.setOpaque(false);
-        badgeWrap.add(badge, BorderLayout.EAST);
-        tile.add(badgeWrap, BorderLayout.CENTER);
-
+        // A dark price bar spanning the tile's full width, at the very bottom — distinct
+        // from the plain in-line price text this replaces, and the one place on the tile
+        // that always carries the brand's own burgundy regardless of whether the item has
+        // a photo.
         String priceText = item.sized() ? "from " + item.lowestPrice().format() : item.singlePrice().format();
+        JPanel priceBar = new JPanel(new BorderLayout());
+        priceBar.setOpaque(true);
+        priceBar.setBackground(Theme.PRIMARY_DARK);
+        priceBar.setBorder(BorderFactory.createEmptyBorder(8, 12, 8, 12));
         JLabel price = new JLabel(priceText);
         price.setFont(Theme.FONT_BODY_BOLD);
-        price.setForeground(Theme.TEXT);
-        tile.add(price, BorderLayout.SOUTH);
+        price.setForeground(Theme.ON_PRIMARY);
+        priceBar.add(price, BorderLayout.WEST);
+        tile.add(priceBar, BorderLayout.SOUTH);
 
-        java.awt.event.MouseAdapter click = new java.awt.event.MouseAdapter() {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e) {
-                onItemPicked(item);
-            }
+        java.awt.event.MouseAdapter hover = new java.awt.event.MouseAdapter() {
             @Override
             public void mouseEntered(java.awt.event.MouseEvent e) {
-                tile.setBackground(Theme.PRIMARY_TINT);
-                tile.setBorder(UiFactory.tileBorder(Theme.PRIMARY));
+                tile.setBorder(BorderFactory.createLineBorder(Theme.PRIMARY, 2, true));
             }
             @Override
             public void mouseExited(java.awt.event.MouseEvent e) {
-                tile.setBackground(Theme.SURFACE);
-                tile.setBorder(UiFactory.tileBorder(Theme.BORDER));
+                tile.setBorder(BorderFactory.createLineBorder(Theme.BORDER, 1, true));
             }
         };
-        tile.addMouseListener(click);
-        name.addMouseListener(click);
-        price.addMouseListener(click);
-        badge.addMouseListener(click);
+        // Tap adds the item; a drag past a small threshold scrolls the menu grid instead
+        // and the tap never fires — the till is touchscreen, and reaching the actual
+        // scrollbar thumb with a fingertip is impractical, so any swipe across the grid
+        // (including one that starts on a tile, which is most of the visible area) has to
+        // scroll rather than silently add whatever tile the finger happened to land on.
+        Runnable tap = () -> onItemPicked(item);
+        for (Component c : new Component[]{tile, name, nameWrap, priceBar, price, image}) {
+            c.addMouseListener(hover);
+            TouchScroll.install((JComponent) c, tap);
+        }
 
         return tile;
     }
 
-    private static JLabel titleLabelInPrimary() {
-        JLabel l = UiFactory.title("Rs 0.00");
-        l.setForeground(Theme.PRIMARY);
-        return l;
+    /** A JPanel whose paint() clips its children to a rounded rectangle — without this,
+     *  the square image label and price bar inside would paint right up to their own
+     *  square corners regardless of the tile's own rounded border, breaking the rounded
+     *  card look right where it matters most (the photo's top corners). */
+    private static final class RoundedPanel extends JPanel {
+        private static final int ARC = 14;
+
+        RoundedPanel(LayoutManager lm) {
+            super(lm);
+        }
+
+        @Override
+        public void paint(Graphics g) {
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setClip(new RoundRectangle2D.Float(0, 0, getWidth(), getHeight(), ARC, ARC));
+            super.paint(g2);
+            g2.dispose();
+        }
+    }
+
+    /** The image area starts blank (or with a cached icon already in hand) and is filled
+     *  in by a background fetch — MenuDao.loadImage is a real DB round trip, and doing
+     *  that on the EDT while a whole grid of tiles is being built would visibly stall the
+     *  New Order screen every time the catalog changes. An item with no uploaded photo
+     *  falls back to a tinted panel with its category's icon centered, so every tile in
+     *  the grid keeps the same silhouette regardless of which items have real photos. */
+    private JComponent buildTileImageArea(MenuItem item) {
+        JLabel imageLabel = new JLabel();
+        imageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        imageLabel.setVerticalAlignment(SwingConstants.CENTER);
+        imageLabel.setOpaque(true);
+        imageLabel.setPreferredSize(new Dimension(TILE_WIDTH, TILE_IMAGE_HEIGHT));
+
+        if (!item.hasImage()) {
+            imageLabel.setBackground(Theme.PRIMARY_TINT);
+            rps.ui.icon.LineIcon icon = rps.ui.icon.LineIcon.forCategory(categoryNameFor(item));
+            if (icon != null) imageLabel.setIcon(icon.of(40, Theme.PRIMARY));
+            return imageLabel;
+        }
+
+        imageLabel.setBackground(Theme.BACKGROUND);
+        ImageIcon cached = tileImageCache.get(item.id());
+        if (cached != null) {
+            imageLabel.setIcon(cached);
+        } else {
+            new SwingWorker<byte[], Void>() {
+                @Override
+                protected byte[] doInBackground() throws Exception {
+                    return menuDao.loadImage(item.id());
+                }
+
+                @Override
+                protected void done() {
+                    try {
+                        byte[] bytes = get();
+                        // -2px accounts for the tile's own 1px border on each side, so the
+                        // cropped photo lands flush with the card edge rather than one
+                        // pixel short of it.
+                        ImageIcon icon = rps.util.ImageUtil.toIconCover(
+                            bytes, TILE_WIDTH - 2, TILE_IMAGE_HEIGHT);
+                        if (icon != null) {
+                            tileImageCache.put(item.id(), icon);
+                            imageLabel.setIcon(icon);
+                        }
+                    } catch (Exception ignore) {
+                        // A tile that fails to load its photo just shows blank rather
+                        // than the category placeholder — the manager will notice and can
+                        // re-upload; it is not worth an error dialog on a 5s poll cycle.
+                    }
+                }
+            }.execute();
+        }
+        return imageLabel;
     }
 
     private void onItemPicked(MenuItem item) {
@@ -389,6 +569,7 @@ public final class PosPanel extends JPanel {
         ticketList.setOpaque(false);
         ticketList.setLayout(new BoxLayout(ticketList, BoxLayout.Y_AXIS));
         ticketList.setAlignmentX(Component.LEFT_ALIGNMENT);
+        TouchScroll.install(ticketList);
 
         // Ticket lines and the order-details controls (type/phone/discount/cash/total)
         // are ONE scrollable column, not a fixed CENTER carved against a fixed SOUTH.
@@ -401,6 +582,7 @@ public final class PosPanel extends JPanel {
         column.setOpaque(true);
         column.setBackground(Theme.SURFACE);
         column.setLayout(new BoxLayout(column, BoxLayout.Y_AXIS));
+        TouchScroll.install(column);
         column.add(ticketList);
         column.add(buildOrderDetailsSection());
 
@@ -410,7 +592,40 @@ public final class PosPanel extends JPanel {
         scroll.getViewport().setOpaque(false);
         scroll.getVerticalScrollBar().setUnitIncrement(16);
         right.add(scroll, BorderLayout.CENTER);
+
+        // Pinned outside the scrollable column, not inside it — the whole point of a
+        // fixed pay bar is that it never needs to be scrolled to, however long the ticket
+        // or the order-details form above it gets.
+        right.add(buildFooter(), BorderLayout.SOUTH);
         return right;
+    }
+
+    /** The running totals just above the pay bar (discount/delivery-fee/change-or-balance)
+     *  plus the bar itself — everything a cashier needs to see immediately before
+     *  confirming, all fixed to the bottom of the screen. */
+    private JComponent buildFooter() {
+        JPanel footer = new JPanel();
+        footer.setOpaque(true);
+        footer.setBackground(Theme.SURFACE);
+        footer.setLayout(new BoxLayout(footer, BoxLayout.Y_AXIS));
+        footer.setBorder(BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.BORDER));
+
+        JPanel breakdown = new JPanel();
+        breakdown.setOpaque(false);
+        breakdown.setLayout(new BoxLayout(breakdown, BoxLayout.Y_AXIS));
+        breakdown.setBorder(BorderFactory.createEmptyBorder(12, 20, 4, 20));
+        discountAmountLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        breakdown.add(discountAmountLabel);
+        deliveryFeeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        breakdown.add(deliveryFeeLabel);
+        changeDueLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        breakdown.add(changeDueLabel);
+        footer.add(breakdown);
+
+        payBar.setActionText("Confirm Order");
+        payBar.setOnClick(this::confirmOrder);
+        footer.add(payBar);
+        return footer;
     }
 
     private JComponent buildOrderDetailsSection() {
@@ -435,14 +650,19 @@ public final class PosPanel extends JPanel {
         panel.add(phoneRow);
         phoneField.getDocument().addDocumentListener((SimpleDocListener) this::validateFields);
 
+        noPhoneCheck.setOpaque(false);
+        noPhoneCheck.setFont(Theme.FONT_SMALL);
+        noPhoneCheck.setAlignmentX(Component.LEFT_ALIGNMENT);
+        noPhoneCheck.addActionListener(e -> validateFields());
+        panel.add(noPhoneCheck);
+
         panel.add(Box.createVerticalStrut(10));
         addressRow.setVisible(false);
         panel.add(addressRow);
         addressField.getDocument().addDocumentListener((SimpleDocListener) this::validateFields);
-
-        deliveryFeeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-        deliveryFeeLabel.setVisible(false);
-        panel.add(deliveryFeeLabel);
+        // deliveryFeeLabel now lives in the fixed footer alongside the other running
+        // totals (buildFooter), not here — it is still the exact same JLabel instance
+        // refreshTotals() updates, just displayed lower on the screen.
 
         fieldsError.setAlignmentX(Component.LEFT_ALIGNMENT);
         panel.add(fieldsError);
@@ -463,8 +683,8 @@ public final class PosPanel extends JPanel {
         discountValueRow.setVisible(false);
         panel.add(Box.createVerticalStrut(8));
         panel.add(discountValueRow);
-        discountAmountLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-        panel.add(discountAmountLabel);
+        // discountAmountLabel is shown in the fixed footer, not here — same instance,
+        // just lower on the screen alongside the other running totals.
         discountValueField.getDocument().addDocumentListener((SimpleDocListener) this::onDiscountChanged);
 
         panel.add(Box.createVerticalStrut(14));
@@ -475,26 +695,9 @@ public final class PosPanel extends JPanel {
         panel.add(Box.createVerticalStrut(8));
         panel.add(labeledField("Cash Paid (leave blank if unpaid)", cashTenderedField));
         cashTenderedField.getDocument().addDocumentListener((SimpleDocListener) this::onCashChanged);
-        panel.add(Box.createVerticalStrut(6));
-        changeDueLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-        panel.add(changeDueLabel);
-
-        panel.add(Box.createVerticalStrut(14));
-        panel.add(divider());
-        panel.add(Box.createVerticalStrut(14));
-
-        JPanel totalRow = new JPanel(new BorderLayout());
-        totalRow.setOpaque(false);
-        totalRow.setAlignmentX(Component.LEFT_ALIGNMENT);
-        totalRow.add(UiFactory.heading("Total"), BorderLayout.WEST);
-        totalRow.add(totalLabel, BorderLayout.EAST);
-        panel.add(totalRow);
-        panel.add(Box.createVerticalStrut(14));
-
-        confirmButton.setAlignmentX(Component.LEFT_ALIGNMENT);
-        confirmButton.setEnabled(false);
-        confirmButton.addActionListener(e -> confirmOrder());
-        panel.add(confirmButton);
+        // changeDueLabel and the running total now live in the fixed footer (buildFooter)
+        // rather than at the end of this scrollable section — see MainWindow-style
+        // "pinned bottom bar" reasoning there.
 
         return panel;
     }
@@ -539,71 +742,6 @@ public final class PosPanel extends JPanel {
             if (c.id() == item.categoryId()) return c.name();
         }
         return "";
-    }
-
-    /** Small circular badge decoration on each menu tile — a pizza-slice doodle for
-     *  pizza categories (matching the reference design), or the category's own icon
-     *  centered in the same ring for everything else, so every tile reads as one
-     *  consistent "circular badge" family rather than pizza tiles looking special. */
-    private static final class TileBadge extends JComponent {
-        private final String categoryName;
-        private final int size;
-
-        TileBadge(String categoryName, int size) {
-            this.categoryName = categoryName;
-            this.size = size;
-            setPreferredSize(new Dimension(size, size));
-            setOpaque(false);
-        }
-
-        @Override
-        protected void paintComponent(Graphics g) {
-            Graphics2D g2 = (Graphics2D) g.create();
-            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-            g2.setStroke(new BasicStroke(1.3f));
-            g2.setColor(Theme.BORDER);
-            g2.draw(new java.awt.geom.Ellipse2D.Float(1, 1, size - 2, size - 2));
-
-            if (categoryNameFor().toLowerCase(java.util.Locale.ROOT).contains("pizza")) {
-                drawPizzaDoodle(g2);
-            } else {
-                rps.ui.icon.LineIcon icon = rps.ui.icon.LineIcon.forCategory(categoryName);
-                if (icon != null) {
-                    int iconSize = Math.round(size * 0.52f);
-                    icon.of(iconSize, Theme.TEXT_MUTED)
-                        .paintIcon(this, g2, (size - iconSize) / 2, (size - iconSize) / 2);
-                }
-            }
-            g2.dispose();
-        }
-
-        private String categoryNameFor() {
-            return categoryName == null ? "" : categoryName;
-        }
-
-        private void drawPizzaDoodle(Graphics2D g2) {
-            float cx = size / 2f, cy = size / 2f;
-            float outer = size * 0.36f, inner = size * 0.14f;
-            g2.setColor(Theme.TEXT_MUTED);
-            g2.setStroke(new BasicStroke(1.1f));
-            g2.draw(new java.awt.geom.Ellipse2D.Float(cx - outer, cy - outer, outer * 2, outer * 2));
-            g2.draw(new java.awt.geom.Ellipse2D.Float(cx - inner, cy - inner, inner * 2, inner * 2));
-            for (int i = 0; i < 6; i++) {
-                double angle = Math.toRadians(i * 60);
-                float x1 = cx + (float) (Math.cos(angle) * inner);
-                float y1 = cy + (float) (Math.sin(angle) * inner);
-                float x2 = cx + (float) (Math.cos(angle) * outer);
-                float y2 = cy + (float) (Math.sin(angle) * outer);
-                g2.draw(new java.awt.geom.Line2D.Float(x1, y1, x2, y2));
-            }
-            for (int i = 0; i < 5; i++) {
-                double angle = Math.toRadians(i * 72 + 30);
-                float r = (outer + inner) / 2f;
-                float dx = cx + (float) (Math.cos(angle) * r);
-                float dy = cy + (float) (Math.sin(angle) * r);
-                g2.fill(new java.awt.geom.Ellipse2D.Float(dx - 1.5f, dy - 1.5f, 3, 3));
-            }
-        }
     }
 
     private static rps.ui.icon.LineIcon orderTypeIcon(OrderType type) {
@@ -720,8 +858,7 @@ public final class PosPanel extends JPanel {
         boolean isDelivery = draft.type() == OrderType.DELIVERY;
         tableRow.setVisible(isDineIn);
         addressRow.setVisible(isDelivery);
-        phoneLabel.setText(isDineIn ? "Phone number (optional)" : "Phone number *");
-        validateFields();
+        validateFields(); // also sets phoneLabel's text, accounting for noPhoneCheck
         refreshTotals();
         revalidate();
         repaint();
@@ -731,12 +868,14 @@ public final class PosPanel extends JPanel {
         draft.setCustomerPhone(phoneField.getText());
         draft.setDeliveryAddress(addressField.getText());
         draft.setTableNumber(tableField.getText());
+        draft.setPhoneNotRequired(noPhoneCheck.isSelected());
 
         boolean isDineIn = draft.type() == OrderType.DINE_IN;
         boolean isDelivery = draft.type() == OrderType.DELIVERY;
         boolean phoneBlank = phoneField.getText().isBlank();
         boolean phoneOk = Validators.isValidPakistaniPhone(phoneField.getText());
-        boolean phoneRequired = !isDineIn;
+        boolean phoneRequired = !isDineIn && !noPhoneCheck.isSelected();
+        phoneLabel.setText(phoneRequired ? "Phone number *" : "Phone number (optional)");
 
         if (phoneBlank || phoneOk) UiFactory.markValid(phoneField);
         else UiFactory.markInvalid(phoneField);
@@ -767,7 +906,7 @@ public final class PosPanel extends JPanel {
     }
 
     private void refreshTotals() {
-        totalLabel.setText(draft.estimatedTotal().format());
+        payBar.setAmount(draft.estimatedTotal().format());
         Money discount = draft.estimatedDiscount();
         discountAmountLabel.setText(discount.isZero() ? " " : "Discount: -" + discount.format());
 
@@ -794,7 +933,7 @@ public final class PosPanel extends JPanel {
     }
 
     private void updateConfirmEnabled() {
-        confirmButton.setEnabled(!submitting && draft.canConfirm());
+        payBar.setPayEnabled(!submitting && draft.canConfirm());
     }
 
     // -------------------------------------------------------------- ticket rows (inline steppers)
@@ -830,10 +969,16 @@ public final class PosPanel extends JPanel {
         row.setBorder(BorderFactory.createCompoundBorder(
             BorderFactory.createMatteBorder(0, 0, 1, 0, Theme.BORDER),
             BorderFactory.createEmptyBorder(12, 20, 12, 20)));
+        // The name/price area has no tap action of its own, so a touchscreen swipe that
+        // starts here (very likely — it's most of the row) needs to scroll the ticket
+        // rather than do nothing. The +/-/× steppers are deliberately left alone: they're
+        // small, precise controls meant to be tapped exactly, not swiped over.
+        TouchScroll.install(row);
 
         JPanel info = new JPanel();
         info.setOpaque(false);
         info.setLayout(new BoxLayout(info, BoxLayout.Y_AXIS));
+        TouchScroll.install(info);
         JLabel name = UiFactory.labelBold(line.displayName());
         JLabel unit = UiFactory.muted(line.unitPrice().format() + " each");
         info.add(name);
@@ -893,14 +1038,71 @@ public final class PosPanel extends JPanel {
         refreshTicket();
     }
 
-    private static JButton confirmButtonStyled() {
-        JButton b = UiFactory.primaryButton("Process Payment");
-        b.setIcon(rps.ui.icon.LineIcon.CONFIRM.of(16, Theme.ON_PRIMARY));
-        b.setIconTextGap(9);
-        b.setAlignmentX(Component.LEFT_ALIGNMENT);
-        b.setMaximumSize(new Dimension(Integer.MAX_VALUE, 48));
-        b.setFont(Theme.FONT_HEADING);
-        return b;
+    /**
+     * A single full-width burgundy bar carrying both the confirm action and the running
+     * total — "Confirm Order" on the left, the amount on the right — in place of a
+     * separate "Total" row above a plain button. Not a JButton: a button paints its own
+     * background across its own bounds only, and getting a two-part label (static action
+     * text + a right-aligned amount that changes independently) onto one JButton without
+     * fighting its own layout would need more surgery than a plain clickable JPanel does.
+     */
+    private static final class PayBar extends JPanel {
+        private final JLabel actionLabel = new JLabel();
+        private final JLabel amountLabel = new JLabel();
+        private boolean payEnabled = true;
+        private Runnable onClick = () -> {};
+
+        PayBar() {
+            setLayout(new BorderLayout());
+            setBorder(BorderFactory.createEmptyBorder(15, 20, 15, 20));
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+
+            actionLabel.setFont(Theme.FONT_HEADING);
+            actionLabel.setIcon(rps.ui.icon.LineIcon.CONFIRM.of(17, Theme.ON_PRIMARY));
+            actionLabel.setIconTextGap(10);
+            amountLabel.setFont(Theme.FONT_TITLE);
+            add(actionLabel, BorderLayout.WEST);
+            add(amountLabel, BorderLayout.EAST);
+            applyColors();
+
+            addMouseListener(new java.awt.event.MouseAdapter() {
+                @Override public void mouseClicked(java.awt.event.MouseEvent e) {
+                    if (payEnabled) onClick.run();
+                }
+                @Override public void mouseEntered(java.awt.event.MouseEvent e) {
+                    if (payEnabled) setBackground(Theme.PRIMARY_DARK);
+                }
+                @Override public void mouseExited(java.awt.event.MouseEvent e) {
+                    applyColors();
+                }
+            });
+        }
+
+        void setActionText(String text) {
+            actionLabel.setText(text);
+        }
+
+        void setAmount(String amount) {
+            amountLabel.setText(amount);
+        }
+
+        void setOnClick(Runnable r) {
+            onClick = r;
+        }
+
+        void setPayEnabled(boolean enabled) {
+            payEnabled = enabled;
+            applyColors();
+            setCursor(Cursor.getPredefinedCursor(enabled ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
+        }
+
+        private void applyColors() {
+            setOpaque(true);
+            setBackground(payEnabled ? Theme.PRIMARY : Theme.BORDER);
+            Color fg = payEnabled ? Theme.ON_PRIMARY : Theme.TEXT_MUTED;
+            actionLabel.setForeground(fg);
+            amountLabel.setForeground(fg);
+        }
     }
 
     // -------------------------------------------------------------- confirm flow
@@ -919,7 +1121,7 @@ public final class PosPanel extends JPanel {
             .message("Saving order…")
             .onSuccess(saved -> {
                 submitting = false;
-                receiptPrinter.printBothAsync(saved);
+                receiptPrinter.printKitchenTicketsAsync(saved);
                 backupService.requestBackup();
                 showOrderConfirmedDialog(saved);
                 resetDraft();
@@ -965,10 +1167,10 @@ public final class PosPanel extends JPanel {
         content.add(total);
 
         content.add(Box.createVerticalStrut(Theme.SPACE_XS));
-        JLabel status = UiFactory.labelBold(saved.status().label()
-            + (saved.status().awaitsPayment()
+        JLabel status = UiFactory.labelBold(saved.paymentStatus().label()
+            + (saved.paymentStatus().awaitsPayment()
                 ? "  ·  Balance due " + saved.totals().balanceDue().format() : ""));
-        status.setForeground(saved.status() == rps.model.OrderStatus.PAYMENT_RECEIVED
+        status.setForeground(saved.paymentStatus().isPaid()
             ? Theme.STATUS_COMPLETED : Theme.STATUS_CANCELLED);
         status.setAlignmentX(Component.CENTER_ALIGNMENT);
         content.add(status);
@@ -1021,6 +1223,7 @@ public final class PosPanel extends JPanel {
         draft.reset();
         tableField.setText("");
         phoneField.setText("");
+        noPhoneCheck.setSelected(false);
         addressField.setText("");
         notesField.setText("");
         discountNoneBtn.setSelected(true);

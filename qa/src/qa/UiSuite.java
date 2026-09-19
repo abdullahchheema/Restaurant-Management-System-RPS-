@@ -10,10 +10,8 @@ import rps.ui.MainWindow;
 import rps.ui.theme.Theme;
 import rps.util.AppSettings;
 
-import javax.swing.JTabbedPane;
 import javax.swing.SwingUtilities;
 import java.awt.Component;
-import java.awt.Container;
 import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -61,6 +59,10 @@ public final class UiSuite {
         Staff employee = new Staff(manager.id(), "", manager.firstName(), manager.lastName(),
             Role.EMPLOYEE, true);
 
+        // New Order, Dashboard, Pay Later (+ Menu, Staff, Reports, Settings for a
+        // manager). Pay Later is deliberately visible to both roles: a cashier is the
+        // one who takes the money back off a customer who owes it. Deliveries (rider
+        // dispatch tracking) was removed outright, not the Delivery order TYPE itself.
         exercise("MGR", "Manager", db, new Session(manager), backup, 7);
         exercise("EMP", "Employee", db, new Session(employee), backup, 3);
 
@@ -85,19 +87,19 @@ public final class UiSuite {
         });
         QA.check(idPrefix + "002", label + ": window realises and lays out", window[0].isShowing(), "");
 
-        JTabbedPane tabs = findTabs(window[0]);
-        QA.check(idPrefix + "003", label + ": tab strip present", tabs != null,
-            tabs == null ? "not found" : tabs.getTabCount() + " tabs");
-        QA.check(idPrefix + "004", label + ": role sees the right tabs",
-            tabs.getTabCount() == expectedTabs, "expected " + expectedTabs + ", got " + tabs.getTabCount());
+        int count = window[0].screenCount();
+        QA.check(idPrefix + "004", label + ": role sees the right screens",
+            count == expectedTabs, "expected " + expectedTabs + ", got " + count);
 
-        for (int i = 0; i < tabs.getTabCount(); i++) {
+        for (int i = 0; i < count; i++) {
             final int index = i;
-            SwingUtilities.invokeAndWait(() -> tabs.setSelectedIndex(index));
+            SwingUtilities.invokeAndWait(() -> window[0].selectScreen(index));
             Thread.sleep(700);   // let each panel's initial background load finish
-            SwingUtilities.invokeAndWait(() -> paintOffscreen(tabs.getComponentAt(index)));
+            String name = window[0].screenNameAt(index);
+            Component comp = window[0].screenComponentAt(index);
+            SwingUtilities.invokeAndWait(() -> paintOffscreen(comp));
             QA.check(idPrefix + "1" + String.format("%02d", i),
-                label + ": tab \"" + tabs.getTitleAt(index) + "\" renders", true, "");
+                label + ": screen \"" + name + "\" renders", true, "");
         }
 
         // The declared minimum size is where layout managers break if they are going to.
@@ -121,14 +123,4 @@ public final class UiSuite {
         }
     }
 
-    private static JTabbedPane findTabs(Container root) {
-        for (Component child : root.getComponents()) {
-            if (child instanceof JTabbedPane tabs) return tabs;
-            if (child instanceof Container container) {
-                JTabbedPane found = findTabs(container);
-                if (found != null) return found;
-            }
-        }
-        return null;
-    }
 }

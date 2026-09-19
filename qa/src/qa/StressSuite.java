@@ -37,14 +37,18 @@ public final class StressSuite {
         db.inTransaction(conn -> {
             bulk(conn, """
                 INSERT INTO customer_order
-                  (order_number, business_date, order_type, status, staff_id, staff_name,
+                  (order_number, business_date, order_type, payment_status, fulfilment_status, staff_id, staff_name,
                    customer_phone, delivery_address, table_number,
                    subtotal, discount_total, tax_total, delivery_fee, total, amount_paid,
                    created_at, completed_at, discount_mode)
                 SELECT 'STRESS-' || g,
                        CURRENT_DATE - (g %% 365),
                        (ARRAY['DINE_IN','TAKEAWAY','DELIVERY'])[1 + (g %% 3)],
-                       (ARRAY['PENDING','PARTIALLY_PAID','PAYMENT_RECEIVED','CANCELLED'])[1 + (g %% 4)],
+                       -- Kept in step with the amount_paid CASE below (0 / 300 / 600 / 0
+                       -- against a 600 total), so the generated rows satisfy the same
+                       -- payment invariants the integrity sweep asserts on real orders.
+                       (ARRAY['UNPAID','PARTIALLY_PAID','PAID','UNPAID'])[1 + (g %% 4)],
+                       (ARRAY['PENDING','PENDING','COMPLETED','CANCELLED'])[1 + (g %% 4)],
                        1, 'Stress',
                        '03001234567',
                        CASE WHEN (g %% 3) = 2 THEN 'stress address line long enough' ELSE NULL END,
@@ -77,10 +81,10 @@ public final class StressSuite {
         LocalDate today = OrderDao.businessDate(java.time.ZonedDateTime.now());
         LocalDate yearAgo = today.minusDays(365);
 
-        long dash = time(() -> orderDao.loadOrders(new OrderDao.OrderFilter(null, null, today, today)));
+        long dash = time(() -> orderDao.loadOrders(new OrderDao.OrderFilter(null, null, null, today, today)));
         check("PERF-DASH", "Dashboard (today) < 500ms", dash < 500, dash + " ms");
 
-        long sum = time(() -> orderDao.dailySummary(new OrderDao.OrderFilter(null, null, today, today)));
+        long sum = time(() -> orderDao.dailySummary(new OrderDao.OrderFilter(null, null, null, today, today)));
         check("PERF-SUM", "Daily summary < 500ms", sum < 500, sum + " ms");
 
         long best = time(() -> reportsDao.bestSellers(yearAgo, today, 10));
@@ -92,7 +96,7 @@ public final class StressSuite {
         long staff = time(() -> reportsDao.staffTotals(yearAgo, today));
         check("PERF-STAFF", "Staff totals, FULL YEAR < 3000ms", staff < 3000, staff + " ms");
 
-        long yearDash = time(() -> orderDao.loadOrders(new OrderDao.OrderFilter(null, null, yearAgo, today)));
+        long yearDash = time(() -> orderDao.loadOrders(new OrderDao.OrderFilter(null, null, null, yearAgo, today)));
         System.out.println("    (dashboard over a FULL YEAR: " + yearDash + " ms — "
             + count(db, "SELECT count(*) FROM customer_order WHERE business_date >= CURRENT_DATE-365") + " rows)");
 
@@ -121,9 +125,9 @@ public final class StressSuite {
         try {
             db.inTransaction(conn -> {
                 try (Statement st = conn.createStatement()) {
-                    st.execute("INSERT INTO customer_order (order_number, business_date, order_type, status,"
+                    st.execute("INSERT INTO customer_order (order_number, business_date, order_type, payment_status,"
                         + " staff_id, staff_name, customer_phone, subtotal, total, discount_mode)"
-                        + " VALUES ('KILLTEST-1', CURRENT_DATE, 'TAKEAWAY', 'PENDING', 1, 'QA',"
+                        + " VALUES ('KILLTEST-1', CURRENT_DATE, 'TAKEAWAY', 'UNPAID', 1, 'QA',"
                         + " '03001234567', 100, 100, 'NONE')");
                     // Terminate THIS backend from inside its own transaction.
                     st.execute("SELECT pg_terminate_backend(pg_backend_pid())");
@@ -182,7 +186,7 @@ public final class StressSuite {
             trackId(o.id());
             orderDao.recordPayment(o.id(), o.totals().total(), 1);
             orderDao.loadOrderForPrint(o.id());
-            orderDao.dailySummary(new OrderDao.OrderFilter(null, null, today, today));
+            orderDao.dailySummary(new OrderDao.OrderFilter(null, null, null, today, today));
         }
         System.gc(); Thread.sleep(300);
         long memAfter = (rt.totalMemory() - rt.freeMemory()) / 1024 / 1024;

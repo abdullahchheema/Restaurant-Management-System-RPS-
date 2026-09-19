@@ -33,8 +33,12 @@ public final class Validators {
         return PK_MOBILE.matcher(normalized).matches() ? normalized : null;
     }
 
+    /** Only non-blank is required — a real address can legitimately be short (a house
+     *  number and a well-known local landmark, common in this shop's own delivery area),
+     *  so the shop asked for the old 10-character floor to be dropped. The database has
+     *  the matching change: see Migrations#19, ck_delivery_address_required. */
     public static boolean isValidAddress(String address) {
-        return !isBlank(address) && address.trim().length() >= 10;
+        return !isBlank(address);
     }
 
     /** Parses a user-entered price string. Returns null if invalid (not a workable decimal, or negative). */

@@ -24,13 +24,14 @@ public final class CsvExport {
         Path file = dir.resolve("orders-" + java.time.LocalDateTime.now().format(FILE_TS) + ".csv");
 
         StringBuilder sb = new StringBuilder();
-        sb.append("Order Number,Date,Type,Status,Items,Subtotal,Discount,Total,Amount Paid,Balance Due,Cash Tendered,Change,Staff,Phone\n");
+        sb.append("Order Number,Date,Type,Status,Payment,Items,Subtotal,Discount,Total,Amount Paid,Balance Due,Cash Tendered,Change,Staff,Phone\n");
         for (OrderDao.OrderRow row : rows) {
             Order o = row.order();
             sb.append(csv(o.orderNumber())).append(',')
               .append(csv(o.createdAt().format(CELL_TS))).append(',')
               .append(csv(o.type().label())).append(',')
-              .append(csv(o.status().label())).append(',')
+              .append(csv(o.fulfilmentStatus().label())).append(',')
+              .append(csv(o.paymentStatus().label())).append(',')
               .append(row.itemCount()).append(',')
               .append(o.totals().subtotal().asBigDecimal()).append(',')
               .append(o.totals().discountTotal().asBigDecimal()).append(',')

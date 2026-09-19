@@ -9,12 +9,19 @@ import rps.util.AppSettings;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
- * Builds both receipt documents from an Order already re-read from the database after
- * commit, so the two documents and the stored record can never disagree. Width is a
- * parameter (columns), not hardcoded — 48 for an 80mm roll, 32 for 58mm — so a receipt
- * printer of either size lays out correctly (see plan Phase D).
+ * Builds the kitchen ticket from an Order already re-read from the database after commit,
+ * so the printed document and the stored record can never disagree. Width is a parameter
+ * (columns), not hardcoded — 48 for an 80mm roll, 32 for 58mm — so a receipt printer of
+ * either size lays out correctly.
+ *
+ * <p>There is deliberately no customer-facing receipt any more: this shop prints two
+ * identical kitchen tickets per order (see ReceiptPrinter) and hands nothing to the
+ * customer. The shop name is the one piece of branding this ticket still carries — just
+ * the configured name (Settings), never the address/phone/footer the old customer receipt
+ * used to show; there is no one outside the kitchen to read those on this document.
  */
 public final class ReceiptRenderer {
 
@@ -26,72 +33,50 @@ public final class ReceiptRenderer {
         this.width = width;
     }
 
-    /** Fixed vertical clearance at the top of both receipts for a future raster logo —
-     *  a plain-text thermal driver can't print an image today, but reserving this space
-     *  now means adding one later doesn't reflow anything below it. */
-    private void logoBlock(StringBuilder sb) {
-        sb.append('\n').append('\n');
-    }
-
-    /** Kitchen ticket: names, sizes, quantities, notes, order type. No prices. */
-    public String kitchenTicket(Order order) {
+    /** Kitchen ticket: the shop name, names/sizes/quantities/notes, order type, who took
+     *  it, the full costing (item prices, subtotal, discount, delivery fee, total,
+     *  cash/change or balance due) and delivery/customer detail — still no address, phone,
+     *  or footer, since there is no customer-facing copy left for those to belong on. Two
+     *  identical copies of this are what gets printed for every order.
+     *
+     *  <p>The order number is returned as the doc's headline rather than written into the
+     *  body, so it prints oversized and bold at the very top; the body still carries the
+     *  full DATE-SEQ number in its detail block below. The shop name is the first line of
+     *  the body, printed at normal size directly beneath that oversized headline. */
+    public ReceiptDoc kitchenTicket(Order order) {
         StringBuilder sb = new StringBuilder();
-        logoBlock(sb);
-        center(sb, "KITCHEN TICKET");
+        center(sb, AppSettings.get().shopName().toUpperCase(Locale.ROOT));
         rule(sb);
         sb.append("Order: ").append(order.orderNumber()).append('\n');
         sb.append("Type:  ").append(order.type().label()).append('\n');
         sb.append("Time:  ").append(order.createdAt().format(TS)).append('\n');
+        sb.append("Staff: ").append(order.staffName()).append('\n');
         if (order.tableNumber() != null && !order.tableNumber().isBlank()) {
             sb.append("Table: ").append(order.tableNumber()).append('\n');
         }
+        if (order.customerName() != null && !order.customerName().isBlank()) {
+            wrap(sb, "Customer: ", order.customerName());
+        }
         if (order.isDelivery()) {
             wrap(sb, "Deliver to: ", order.deliveryAddress());
+        }
+        if (order.customerPhone() != null && !order.customerPhone().isBlank()) {
             sb.append("Phone: ").append(order.customerPhone()).append('\n');
         }
         rule(sb);
-        for (OrderLine line : order.lines()) {
-            // Wrapped, not raw: this is the line the kitchen actually cooks from, so a
-            // long combo name being clipped at the paper edge means the wrong food.
-            wrap(sb, String.format("%2dx ", line.quantity()), line.displayName());
-            if (line.hasOption()) {
-                wrap(sb, "   " + line.optionGroupName() + ": ", line.optionValueName());
-            }
-            if (line.notes() != null && !line.notes().isBlank()) {
-                wrap(sb, "   note: ", line.notes());
-            }
-        }
+        itemLines(sb, order);
+        rule(sb);
+        totalsAndPayment(sb, order);
         rule(sb);
         if (order.notes() != null && !order.notes().isBlank()) {
             wrap(sb, "Notes: ", order.notes());
         }
-        return sb.toString();
+        return new ReceiptDoc(ReceiptDoc.headlineFor(order.orderNumber()), sb.toString());
     }
 
-    /** Customer receipt: itemised with prices, subtotal, discount, total, cash/change. */
-    public String customerReceipt(Order order) {
-        AppSettings settings = AppSettings.get();
-        StringBuilder sb = new StringBuilder();
-        logoBlock(sb);
-        center(sb, settings.shopName().toUpperCase(java.util.Locale.ROOT));
-        if (!settings.shopAddress().isBlank()) {
-            wrapCentered(sb, settings.shopAddress());
-        }
-        if (!settings.shopPhone().isBlank()) {
-            center(sb, settings.shopPhone());
-        }
-        rule(sb);
-        sb.append("Order:  ").append(order.orderNumber()).append('\n');
-        sb.append("Date:   ").append(order.createdAt().format(TS)).append('\n');
-        sb.append("Type:   ").append(order.type().label()).append('\n');
-        if (order.tableNumber() != null && !order.tableNumber().isBlank()) {
-            sb.append("Table:  ").append(order.tableNumber()).append('\n');
-        }
-        if (order.isDelivery()) {
-            wrap(sb, "Deliver to: ", order.deliveryAddress());
-            sb.append("Phone:  ").append(order.customerPhone()).append('\n');
-        }
-        rule(sb);
+    /** One line per order line: quantity + name on the left, that line's total on the
+     *  right, with each line's cooking notes underneath it. */
+    private void itemLines(StringBuilder sb, Order order) {
         for (OrderLine line : order.lines()) {
             String left = line.quantity() + "x " + line.displayName();
             String right = line.lineTotal().format();
@@ -99,9 +84,15 @@ public final class ReceiptRenderer {
             if (line.hasOption()) {
                 wrap(sb, "   " + line.optionGroupName() + ": ", line.optionValueName());
             }
+            if (line.notes() != null && !line.notes().isBlank()) {
+                wrap(sb, "   note: ", line.notes());
+            }
         }
-        rule(sb);
+    }
 
+    /** Subtotal through balance-due/status — the full costing, printed on the kitchen
+     *  ticket so whoever hands the order over can see exactly what is owed. */
+    private void totalsAndPayment(StringBuilder sb, Order order) {
         OrderTotals t = order.totals();
         padLine(sb, "Subtotal", t.subtotal().format());
         if (!t.discountTotal().isZero()) {
@@ -125,14 +116,8 @@ public final class ReceiptRenderer {
         padLine(sb, "Paid", t.amountPaid().format());
         if (!t.isFullyPaid()) {
             padLine(sb, "BALANCE DUE", t.balanceDue().format());
-            center(sb, "STATUS: " + order.status().label().toUpperCase(java.util.Locale.ROOT));
+            center(sb, "STATUS: " + order.paymentStatus().label().toUpperCase(java.util.Locale.ROOT));
         }
-
-        rule(sb);
-        if (!settings.receiptFooter().isBlank()) {
-            wrapCentered(sb, settings.receiptFooter());
-        }
-        return sb.toString();
     }
 
     private static String discountLabel(Order order) {

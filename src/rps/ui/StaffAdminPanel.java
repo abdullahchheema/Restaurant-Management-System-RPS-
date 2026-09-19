@@ -68,6 +68,7 @@ public final class StaffAdminPanel extends JPanel {
             l.setBorder(BorderFactory.createEmptyBorder(9, 10, 9, 10));
             return l;
         });
+        TouchScroll.install(staffList);
         staffCardHolder.setOpaque(false);
         staffCardHolder.add(new JScrollPane(staffList), "list");
         staffCardHolder.add(staffEmpty, "empty");

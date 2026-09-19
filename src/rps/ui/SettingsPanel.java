@@ -17,6 +17,9 @@ import java.util.List;
 
 public final class SettingsPanel extends JPanel {
 
+    private final Session session;
+    private final rps.db.OrderDao orderDao;
+    private final rps.db.StaffDao staffDao;
     private final OffsiteBackupService offsiteBackupService;
     private final AppSettings settings = AppSettings.get();
 
@@ -27,6 +30,9 @@ public final class SettingsPanel extends JPanel {
 
     private final JToggleButton width80Btn = UiFactory.chipToggle("80mm", true);
     private final JToggleButton width58Btn = UiFactory.chipToggle("58mm", false);
+    private final JToggleButton textNormalBtn = UiFactory.chipToggle("Normal", false);
+    private final JToggleButton textLargeBtn = UiFactory.chipToggle("Large", true);
+    private final JToggleButton textXlBtn = UiFactory.chipToggle("Extra large", false);
     private final JComboBox<String> printerCombo = new JComboBox<>();
     private final JCheckBox silentPrintCheck = new JCheckBox("Print automatically when an order is confirmed");
 
@@ -42,9 +48,13 @@ public final class SettingsPanel extends JPanel {
     private final JLabel deliveryErrorLabel = UiFactory.errorText(" ");
 
     private final JTextField editWindowField = UiFactory.textField(6);
+    private final JTextField cancelWindowField = UiFactory.textField(6);
     private final JLabel editWindowErrorLabel = UiFactory.errorText(" ");
 
     public SettingsPanel(Db db, Session session, OffsiteBackupService offsiteBackupService) {
+        this.session = session;
+        this.orderDao = new rps.db.OrderDao(db);
+        this.staffDao = new rps.db.StaffDao(db);
         this.offsiteBackupService = offsiteBackupService;
 
         setLayout(new BorderLayout());
@@ -54,6 +64,7 @@ public final class SettingsPanel extends JPanel {
         JPanel content = new JPanel();
         content.setOpaque(false);
         content.setLayout(new BoxLayout(content, BoxLayout.Y_AXIS));
+        TouchScroll.install(content);
         content.add(UiFactory.title("Settings"));
         content.add(Box.createVerticalStrut(16));
 
@@ -61,11 +72,13 @@ public final class SettingsPanel extends JPanel {
         content.add(Box.createVerticalStrut(14));
         content.add(card("Delivery Fee", buildDeliveryForm()));
         content.add(Box.createVerticalStrut(14));
-        content.add(card("Order Editing", buildOrderEditForm()));
+        content.add(card("Order Editing & Cancellation", buildOrderEditForm()));
         content.add(Box.createVerticalStrut(14));
         content.add(card("Receipt Printer", buildPrinterForm()));
         content.add(Box.createVerticalStrut(14));
         content.add(card("Backup (Backblaze B2)", buildOffsiteBackupForm()));
+        content.add(Box.createVerticalStrut(14));
+        content.add(card("Danger Zone", buildDangerZoneForm()));
 
         JScrollPane scroll = new JScrollPane(content);
         scroll.setBorder(null);
@@ -153,26 +166,37 @@ public final class SettingsPanel extends JPanel {
         JPanel form = new JPanel();
         form.setOpaque(false);
         form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
-        form.add(UiFactory.muted("From the Dashboard, any staff member can edit a confirmed order — items,"
-            + " order type, discount — for this long after it was placed. A cancelled order or one"
-            + " past this window can no longer be edited."));
+        form.add(UiFactory.muted("<html><div style='width:520px'>From the Dashboard, any staff member"
+            + " can edit a confirmed order — items, order type, discount — for the edit window after it"
+            + " was placed, and can cancel it for the cancellation window. The two are separate on"
+            + " purpose: changing an order and voiding it are different decisions. Past the"
+            + " cancellation window an order can still be voided with Force Cancel, which is recorded"
+            + " against whoever used it. Both windows apply whether or not the customer has"
+            + " paid.</div></html>"));
         form.add(Box.createVerticalStrut(10));
 
-        form.add(labeledField("Edit window (minutes)", editWindowField));
+        JPanel windows = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 4));
+        windows.setOpaque(false);
+        windows.setAlignmentX(Component.LEFT_ALIGNMENT);
+        windows.add(labeledField("Edit window (minutes)", editWindowField));
+        windows.add(labeledField("Cancellation window (minutes)", cancelWindowField));
+        form.add(windows);
         editWindowErrorLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
         form.add(editWindowErrorLabel);
         form.add(Box.createVerticalStrut(6));
 
-        JButton save = UiFactory.primaryButton("Save Edit Window");
+        JButton save = UiFactory.primaryButton("Save Windows");
         save.setAlignmentX(Component.LEFT_ALIGNMENT);
         save.addActionListener(e -> {
             Integer minutes = parsePositiveInt(editWindowField.getText());
-            if (minutes == null) {
-                editWindowErrorLabel.setText("Enter a whole number of minutes (1 or more).");
+            Integer cancelMinutes = parsePositiveInt(cancelWindowField.getText());
+            if (minutes == null || cancelMinutes == null) {
+                editWindowErrorLabel.setText("Enter a whole number of minutes (1 or more) in both fields.");
                 return;
             }
             editWindowErrorLabel.setText(" ");
             settings.setOrderEditWindowMinutes(minutes);
+            settings.setOrderCancelWindowMinutes(cancelMinutes);
             JOptionPane.showMessageDialog(this, "Saved.");
         });
         form.add(save);
@@ -206,6 +230,26 @@ public final class SettingsPanel extends JPanel {
         form.add(widthRow);
         form.add(Box.createVerticalStrut(10));
 
+        JPanel textRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
+        textRow.setOpaque(false);
+        textRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+        ButtonGroup textGroup = new ButtonGroup();
+        textGroup.add(textNormalBtn);
+        textGroup.add(textLargeBtn);
+        textGroup.add(textXlBtn);
+        textRow.add(UiFactory.label("Receipt text size:"));
+        textRow.add(textNormalBtn);
+        textRow.add(textLargeBtn);
+        textRow.add(textXlBtn);
+        form.add(textRow);
+        form.add(Box.createVerticalStrut(6));
+        form.add(UiFactory.muted("<html><div style='width:520px'>Bigger text means fewer characters"
+            + " across the roll, so a long item name wraps onto more lines and the receipt is"
+            + " taller — nothing is ever cut off. On an 80mm roll these print at roughly 7.25pt,"
+            + " 8.25pt and 9.25pt. Use Preview Receipt to see the effect before"
+            + " printing.</div></html>"));
+        form.add(Box.createVerticalStrut(10));
+
         JPanel printerRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
         printerRow.setOpaque(false);
         printerRow.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -230,6 +274,10 @@ public final class SettingsPanel extends JPanel {
         save.setAlignmentX(Component.LEFT_ALIGNMENT);
         save.addActionListener(e -> {
             settings.setReceiptPaperWidthMm(width58Btn.isSelected() ? 58 : 80);
+            settings.setReceiptTextSize(
+                textNormalBtn.isSelected() ? rps.print.RollSpec.TextSize.NORMAL
+                : textXlBtn.isSelected() ? rps.print.RollSpec.TextSize.EXTRA_LARGE
+                : rps.print.RollSpec.TextSize.LARGE);
             Object selected = printerCombo.getSelectedItem();
             settings.setPrinterName("Auto (system default)".equals(selected) ? "" : String.valueOf(selected));
             settings.setSilentPrintingEnabled(silentPrintCheck.isSelected());
@@ -365,14 +413,109 @@ public final class SettingsPanel extends JPanel {
         deliveryThresholdField.setText(rps.util.Money.fromDouble(settings.deliveryFeeThreshold()).asBigDecimal().toPlainString());
         deliveryFeeAmountField.setText(rps.util.Money.fromDouble(settings.deliveryFeeAmount()).asBigDecimal().toPlainString());
         editWindowField.setText(Integer.toString(settings.orderEditWindowMinutes()));
+        cancelWindowField.setText(Integer.toString(settings.orderCancelWindowMinutes()));
         boolean is58 = settings.receiptPaperWidthMm() < 70;
         width58Btn.setSelected(is58);
         width80Btn.setSelected(!is58);
+        switch (settings.receiptTextSize()) {
+            case NORMAL -> textNormalBtn.setSelected(true);
+            case LARGE -> textLargeBtn.setSelected(true);
+            case EXTRA_LARGE -> textXlBtn.setSelected(true);
+        }
         silentPrintCheck.setSelected(settings.isSilentPrintingEnabled());
         boolean interval = settings.offsiteTriggerMode() == OffsiteBackupService.TriggerMode.INTERVAL;
         triggerIntervalBtn.setSelected(interval);
         triggerPerOrderBtn.setSelected(!interval);
         syncIntervalField.setText(Integer.toString(settings.offsiteSyncIntervalMinutes()));
+    }
+
+    private JComponent buildDangerZoneForm() {
+        JPanel form = new JPanel();
+        form.setOpaque(false);
+        form.setLayout(new BoxLayout(form, BoxLayout.Y_AXIS));
+        form.add(UiFactory.muted("<html><div style='width:520px'>Permanently deletes every"
+            + " order, delivery run and rider — the entire sales history and till record."
+            + " The menu and staff accounts are NOT affected. There is no undo; take a"
+            + " backup first if this data might be needed again.</div></html>"));
+        form.add(Box.createVerticalStrut(10));
+
+        JButton reset = new JButton("Reset All Data…");
+        reset.setFont(Theme.FONT_BODY_BOLD);
+        reset.setForeground(Theme.STATUS_CANCELLED);
+        reset.setBackground(Theme.SURFACE);
+        reset.setFocusPainted(false);
+        reset.setMargin(new Insets(9, 19, 9, 19));
+        reset.setBorder(BorderFactory.createLineBorder(Theme.STATUS_CANCELLED, 1, true));
+        reset.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        reset.setAlignmentX(Component.LEFT_ALIGNMENT);
+        reset.addActionListener(e -> confirmAndResetAllData());
+        form.add(reset);
+        return form;
+    }
+
+    /**
+     * Three separate, escalating confirmations before a single irreversible SQL
+     * statement runs — deliberately more friction than anything else in this app,
+     * because nothing else in this app deletes the entire order history in one action:
+     *   1. A plain confirm that spells out exactly what is and is not affected.
+     *   2. Re-entering the signed-in manager's own password — proves this is the
+     *      account holder acting deliberately, not whoever is standing at an
+     *      already-unlocked till.
+     *   3. Typing the literal word RESET — the same pattern GitHub uses before deleting
+     *      a repository, so a reflexive third click of "Yes" can't slip through.
+     * Any cancellation, wrong password, or mismatched text at any step aborts with
+     * nothing changed — resetAllTradingData() only ever runs after all three pass.
+     */
+    private void confirmAndResetAllData() {
+        int step1 = JOptionPane.showConfirmDialog(this,
+            "This permanently deletes every order, delivery run and rider —\n"
+                + "the entire sales history and till record.\n\n"
+                + "The menu and staff accounts are NOT affected.\n\n"
+                + "This cannot be undone. Continue?",
+            "Reset All Data — Step 1 of 3", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (step1 != JOptionPane.YES_OPTION) return;
+
+        JPasswordField passwordField = new JPasswordField();
+        int step2 = JOptionPane.showConfirmDialog(this,
+            new Object[]{"Step 2 of 3 — confirm it's you.",
+                "Re-enter your password (" + session.staffName() + "):", passwordField},
+            "Reset All Data — Step 2 of 3", JOptionPane.OK_CANCEL_OPTION);
+        if (step2 != JOptionPane.OK_OPTION) return;
+        char[] pw = passwordField.getPassword();
+        String password = new String(pw);
+        java.util.Arrays.fill(pw, '\0');
+        boolean authenticated;
+        try {
+            authenticated = staffDao.authenticate(session.staffId(), password) != null;
+        } catch (rps.db.DatabaseException e) {
+            JOptionPane.showMessageDialog(this, "Could not verify your password: " + e.getMessage(),
+                "Error", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        if (!authenticated) {
+            JOptionPane.showMessageDialog(this, "Incorrect password. Reset cancelled.",
+                "Reset All Data", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        String typed = JOptionPane.showInputDialog(this,
+            "Step 3 of 3 — type RESET (in capitals) to permanently delete this data:",
+            "Reset All Data — Step 3 of 3", JOptionPane.WARNING_MESSAGE);
+        if (!"RESET".equals(typed)) {
+            if (typed != null && !typed.isBlank()) {
+                JOptionPane.showMessageDialog(this, "Text did not match \"RESET\" exactly. Reset cancelled.");
+            }
+            return;
+        }
+
+        try {
+            orderDao.resetAllTradingData();
+            JOptionPane.showMessageDialog(this,
+                "All order and delivery data has been reset. The menu and staff accounts were not touched.",
+                "Reset complete", JOptionPane.INFORMATION_MESSAGE);
+        } catch (rps.db.DatabaseException e) {
+            JOptionPane.showMessageDialog(this, "Reset failed: " + e.getMessage(), "Error", JOptionPane.ERROR_MESSAGE);
+        }
     }
 
     private static JComponent labeledField(String labelText, JTextField field) {

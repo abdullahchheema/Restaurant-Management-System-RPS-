@@ -221,7 +221,7 @@ public final class MenuDao {
                             COALESCE((
                                 SELECT string_agg(
                                     mi.id || ':' || mi.name || ':' || mi.display_order || ':' ||
-                                    COALESCE(mi.option_group_id, 0) || ':' ||
+                                    COALESCE(mi.option_group_id, 0) || ':' || COALESCE(md5(mi.image), '') || ':' ||
                                     v.id || ':' || COALESCE(v.size_label, '') || ':' || v.price || ':' || v.display_order,
                                     ',' ORDER BY mi.id, v.id)
                                 FROM menu_item mi
@@ -257,7 +257,7 @@ public final class MenuDao {
             : "mi.deleted_at IS NULL" + (availableOnly ? " AND mi.available = TRUE" : "");
         String sql = """
             SELECT mi.id, mi.category_id, mi.name, mi.description, mi.sized, mi.available, mi.display_order,
-                   mi.option_group_id,
+                   mi.option_group_id, (mi.image IS NOT NULL) AS has_image,
                    v.id AS variant_id, v.size_label, v.price, v.available AS variant_available, v.display_order AS variant_order
             FROM menu_item mi
             LEFT JOIN menu_item_variant v ON v.menu_item_id = mi.id AND v.deleted_at IS NULL
@@ -309,7 +309,8 @@ public final class MenuDao {
                     rs.getBoolean("available"),
                     rs.getInt("display_order"),
                     variantsByItem.get(itemId),
-                    null
+                    null,
+                    rs.getBoolean("has_image")
                 ));
             }
         }
@@ -331,7 +332,8 @@ public final class MenuDao {
             Integer groupId = optionGroupIdByItem.get(mi.id());
             OptionGroup group = groupId == null ? null : groupsById.get(groupId);
             result.add(new MenuItem(mi.id(), mi.categoryId(), mi.name(), mi.description(),
-                mi.sized(), mi.available(), mi.displayOrder(), variantsByItem.get(mi.id()), group));
+                mi.sized(), mi.available(), mi.displayOrder(), variantsByItem.get(mi.id()), group,
+                mi.hasImage()));
         }
         return result;
     }
@@ -394,6 +396,43 @@ public final class MenuDao {
                 ps.executeUpdate();
             }
             return null;
+        });
+    }
+
+    /** Stores a menu item's photo — already resized/re-encoded by the caller (see
+     *  rps.util.ImageUtil), never the raw upload, so a multi-megapixel phone photo never
+     *  reaches this column. {@code imageBytes == null} clears it, same as removeImage(). */
+    public void setItemImage(int itemId, byte[] imageBytes) throws DatabaseException {
+        db.inTransaction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE menu_item SET image = ? WHERE id = ?")) {
+                if (imageBytes == null) {
+                    ps.setNull(1, java.sql.Types.BINARY);
+                } else {
+                    ps.setBytes(1, imageBytes);
+                }
+                ps.setInt(2, itemId);
+                ps.executeUpdate();
+            }
+            return null;
+        });
+    }
+
+    public void removeItemImage(int itemId) throws DatabaseException {
+        setItemImage(itemId, null);
+    }
+
+    /** Fetches one item's photo bytes on demand — deliberately not part of any list
+     *  query (see MenuItem.hasImage), so painting a tile costs one small read only for
+     *  items that actually have a photo, and only when something is about to display it. */
+    public byte[] loadImage(int itemId) throws DatabaseException {
+        return db.inReadOnly(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT image FROM menu_item WHERE id = ?")) {
+                ps.setInt(1, itemId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return null;
+                    return rs.getBytes(1);
+                }
+            }
         });
     }
 
@@ -485,7 +524,7 @@ public final class MenuDao {
     private MenuItem findItemById(Connection conn, int itemId) throws SQLException, DatabaseException {
         try (PreparedStatement ps = conn.prepareStatement("""
                 SELECT mi.id, mi.category_id, mi.name, mi.description, mi.sized, mi.available, mi.display_order,
-                       mi.option_group_id,
+                       mi.option_group_id, (mi.image IS NOT NULL) AS has_image,
                        v.id AS variant_id, v.size_label, v.price, v.available AS variant_available, v.display_order AS variant_order
                 FROM menu_item mi
                 LEFT JOIN menu_item_variant v ON v.menu_item_id = mi.id AND v.deleted_at IS NULL

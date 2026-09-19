@@ -85,6 +85,7 @@ public final class MenuAdminPanel extends JPanel {
 
         categoryList.setOpaque(false);
         categoryList.setLayout(new BoxLayout(categoryList, BoxLayout.Y_AXIS));
+        TouchScroll.install(categoryList);
 
         JScrollPane scroll = new JScrollPane(categoryList);
         scroll.setBorder(null);
@@ -120,12 +121,10 @@ public final class MenuAdminPanel extends JPanel {
         RoundedToggle pill = new RoundedToggle(c.name(), selected, Theme.RADIUS_MD);
         pill.setAlignmentX(Component.LEFT_ALIGNMENT);
         pill.setMaximumSize(new Dimension(Integer.MAX_VALUE, 42));
-        pill.addMouseListener(new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                selectedCategory = c;
-                rebuildCategoryList();
-                filterItems();
-            }
+        TouchScroll.install(pill, () -> {
+            selectedCategory = c;
+            rebuildCategoryList();
+            filterItems();
         });
         return pill;
     }
@@ -152,6 +151,7 @@ public final class MenuAdminPanel extends JPanel {
         panel.add(header, BorderLayout.NORTH);
 
         itemGrid.setOpaque(false);
+        TouchScroll.install(itemGrid);
         JScrollPane scroll = new JScrollPane(itemGrid,
             ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED, ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
         scroll.setBorder(null);
@@ -212,17 +212,17 @@ public final class MenuAdminPanel extends JPanel {
         textCol.add(UiFactory.muted(priceText));
         card.add(textCol, BorderLayout.CENTER);
 
-        MouseAdapter click = new MouseAdapter() {
-            @Override public void mouseClicked(MouseEvent e) {
-                selectedItem = item;
-                updateActionButtons();
-                if (e.getClickCount() == 2) editSelected();
-            }
+        // Wired through TouchScroll: a touchscreen swipe across the item grid very likely
+        // starts on a card (most of the grid is cards), so it must scroll rather than
+        // select/open whatever card it started on.
+        java.util.function.Consumer<MouseEvent> click = (MouseEvent e) -> {
+            selectedItem = item;
+            updateActionButtons();
+            if (e.getClickCount() == 2) editSelected();
         };
-        card.addMouseListener(click);
-        badge.addMouseListener(click);
-        textCol.addMouseListener(click);
-        name.addMouseListener(click);
+        for (JComponent c : new JComponent[]{card, badge, textCol, name}) {
+            TouchScroll.install(c, click);
+        }
 
         return card;
     }

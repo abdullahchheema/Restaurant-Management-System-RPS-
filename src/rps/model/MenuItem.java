@@ -13,7 +13,14 @@ public record MenuItem(
     boolean available,
     int displayOrder,
     List<MenuItemVariant> variants,
-    OptionGroup optionGroup   // null when this item has no attached option group
+    OptionGroup optionGroup,  // null when this item has no attached option group
+    /** Whether a photo is stored for this item — never the bytes themselves. Every list
+     *  query in MenuDao that returns MenuItem is polled every few seconds by PosPanel
+     *  (fingerprint-gated) and by the Menu admin screen; carrying the actual image bytes
+     *  on every row of every poll would multiply that payload by however large the
+     *  photos are. Callers that need to actually paint the image fetch it once, by id,
+     *  via MenuDao.loadImage(). */
+    boolean hasImage
 ) {
     /** Lowest price across variants — used for "from Rs X" tile labels on sized items. */
     public Money lowestPrice() {

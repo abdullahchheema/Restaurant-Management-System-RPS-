@@ -132,6 +132,24 @@ public final class AppSettings {
         set("order.editWindowMinutes", Integer.toString(minutes));
     }
 
+    /** How long after an order is placed it can still be cancelled normally. Separate from
+     *  the edit window on purpose: changing what is on an order and voiding it outright are
+     *  different decisions with different exposure, so a shop may well want a short edit
+     *  window and a longer cancellation one (or the reverse). Past this, cancelling needs
+     *  the explicit Force Cancel, which is always recorded against the staff member who
+     *  used it. Applies whether or not the order has been paid. */
+    public int orderCancelWindowMinutes() {
+        try {
+            return Integer.parseInt(get("order.cancelWindowMinutes", "15"));
+        } catch (NumberFormatException e) {
+            return 15;
+        }
+    }
+
+    public void setOrderCancelWindowMinutes(int minutes) {
+        set("order.cancelWindowMinutes", Integer.toString(minutes));
+    }
+
     // ---------------------------------------------------------------- printing
 
     public boolean isSilentPrintingEnabled() {
@@ -155,6 +173,21 @@ public final class AppSettings {
         set("printer.paperWidthMm", Double.toString(mm));
     }
 
+    /** Printed text size. Defaults to LARGE rather than NORMAL: at the standard 48
+     *  columns an 80mm roll prints at only 7.25pt, which the shop found too small to read
+     *  across a counter. See RollSpec.TextSize for what the setting actually changes. */
+    public rps.print.RollSpec.TextSize receiptTextSize() {
+        try {
+            return rps.print.RollSpec.TextSize.valueOf(get("printer.textSize", "LARGE"));
+        } catch (IllegalArgumentException e) {
+            return rps.print.RollSpec.TextSize.LARGE;
+        }
+    }
+
+    public void setReceiptTextSize(rps.print.RollSpec.TextSize size) {
+        set("printer.textSize", size.name());
+    }
+
     /** Exact PrintService name to use, or blank to auto-pick the default (skipping known
      *  virtual/document-writer devices, since those pop a "Save output as" dialog). */
     public String printerName() { return get("printer.name", ""); }
@@ -164,14 +197,45 @@ public final class AppSettings {
         return Path.of(System.getProperty("user.home"), "Documents", "RoyalPizzaSahowala", "receipts");
     }
 
+    // ---------------------------------------------------------------- stay signed in
+
+    /** The staff member to sign back in as automatically on next launch, or empty if
+     *  nobody should be — cleared on explicit logout. Storing only the id (not the
+     *  password) means a restored session always re-reads the staff's current row, so a
+     *  role change or deactivation since the last launch takes effect immediately. */
+    public java.util.Optional<Integer> stayedSignedInStaffId() {
+        String v = get("session.stayedSignedInStaffId", "");
+        if (v.isBlank()) return java.util.Optional.empty();
+        try {
+            return java.util.Optional.of(Integer.parseInt(v));
+        } catch (NumberFormatException e) {
+            return java.util.Optional.empty();
+        }
+    }
+
+    public void setStayedSignedInStaffId(Integer id) {
+        set("session.stayedSignedInStaffId", id == null ? null : String.valueOf(id));
+    }
+
     // ---------------------------------------------------------------- offsite backup (Backblaze B2)
 
     /** Local staging directory — holds a dump file only transiently, between pg_dump
      *  finishing and the B2 upload confirming, after which it's deleted. Kept outside
-     *  Documents/OneDrive for the same reason described in the class comment. */
+     *  Documents/OneDrive for the same reason described in the class comment.
+     *
+     *  <p>Defaults under %ProgramData%, not a bare C:\ path — a standard (non-admin)
+     *  Windows account cannot create a directory at the root of C:\, so that literal
+     *  default silently failed every backup with AccessDeniedException on a client
+     *  machine. ProgramData is writable by the installer up front and by any local user
+     *  thereafter. Falls back to the previous literal only if the environment variable
+     *  is somehow unset, which should not happen on any real Windows install. */
     public Path backupDir() {
         String custom = get("backup.dir", "");
-        return custom.isBlank() ? Path.of("C:\\RoyalPizzaSahowala\\backups") : Path.of(custom);
+        if (!custom.isBlank()) return Path.of(custom);
+        String programData = System.getenv("ProgramData");
+        return programData == null || programData.isBlank()
+            ? Path.of("C:\\RoyalPizzaSahowala\\backups")
+            : Path.of(programData, "Royal Pizza Sahowala", "backups");
     }
 
     public void setBackupDir(String dir) { set("backup.dir", dir); }

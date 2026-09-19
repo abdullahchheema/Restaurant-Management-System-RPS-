@@ -8,12 +8,16 @@ import rps.ui.icon.LineIcon;
 import rps.ui.theme.Theme;
 import rps.ui.theme.UiFactory;
 
+import javax.imageio.ImageIO;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.Ellipse2D;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.net.URL;
 
 /**
  * Shown first, before anything else is reachable. MainWindow can only be constructed
@@ -183,6 +187,7 @@ public final class LoginWindow extends JFrame {
                     passwordField.setText("");
                     return;
                 }
+                rps.util.AppSettings.get().setStayedSignedInStaffId(staff.id());
                 Session session = new Session(staff);
                 new MainWindow(db, session, offsiteBackupService).setVisible(true);
                 dispose();
@@ -271,23 +276,55 @@ public final class LoginWindow extends JFrame {
         }
     }
 
-    /** Hand-painted circular wordmark badge — the shop has no supplied logo image, so
-     *  this is a ring, a pizza-slice glyph from the shared icon family, and "RPS" set in
-     *  the brand typeface, composed to read as one mark rather than three stacked parts. */
+    /** Circular badge showing the shop's actual logo artwork (images/rps-logo.png — the
+     *  same classpath/filesystem candidates BrandLogo uses), clipped to a circle so the
+     *  artwork's square black background never shows as a hard-edged box against the
+     *  login screen. Falls back to a hand-painted ring + pizza-glyph + "RPS" wordmark if
+     *  no logo file is found, so the login screen never looks broken. */
     private static final class RpsLogoBadge extends JComponent {
+        private static final String[] CANDIDATES = {"images/rps-logo.png", "images/rps-logo.jpg"};
+
         private final int size;
+        private final BufferedImage logo;
 
         RpsLogoBadge(int size) {
             this.size = size;
+            this.logo = loadLogo();
             setPreferredSize(new Dimension(size, size));
             setOpaque(false);
+        }
+
+        private static BufferedImage loadLogo() {
+            for (String name : CANDIDATES) {
+                try {
+                    URL url = RpsLogoBadge.class.getClassLoader().getResource(name);
+                    if (url != null) return ImageIO.read(url);
+                    File f = new File(name);
+                    if (f.exists()) return ImageIO.read(f);
+                } catch (Exception ignored) {
+                    // Falls through to the next candidate, then to the hand-painted badge.
+                }
+            }
+            return null;
         }
 
         @Override
         protected void paintComponent(Graphics g) {
             Graphics2D g2 = (Graphics2D) g.create();
             g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
 
+            if (logo != null) {
+                g2.setClip(new Ellipse2D.Float(0, 0, size, size));
+                g2.drawImage(logo, 0, 0, size, size, null);
+            } else {
+                paintHandDrawnFallback(g2);
+            }
+
+            g2.dispose();
+        }
+
+        private void paintHandDrawnFallback(Graphics2D g2) {
             Color gold = Theme.ACCENT_DEEP;
             float ringStroke = size * 0.028f;
             g2.setStroke(new BasicStroke(ringStroke, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
@@ -309,8 +346,6 @@ public final class LoginWindow extends JFrame {
             int textX = (size - fm.stringWidth(text)) / 2;
             int textY = Math.round(size * 0.74f);
             g2.drawString(text, textX, textY);
-
-            g2.dispose();
         }
     }
 }

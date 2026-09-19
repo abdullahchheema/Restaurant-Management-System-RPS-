@@ -109,21 +109,19 @@ public final class QA {
 
     public static void trackId(long id) { createdOrders.add(id); }
 
-    /** Removes every order this suite created, plus QA-created riders/runs/option groups. */
+    /** Removes every order this suite created, plus QA-created option groups. Rider/
+     *  delivery-run cleanup was removed along with that feature (migration 23) — those
+     *  tables no longer exist. */
     public static void cleanup(Db db) throws DatabaseException {
         for (long id : createdOrders) {
             db.inTransaction(conn -> {
-                exec(conn, "UPDATE customer_order SET delivery_run_id = NULL WHERE id = " + id);
                 exec(conn, "DELETE FROM order_status_history WHERE order_id = " + id);
+                exec(conn, "DELETE FROM order_line WHERE order_id = " + id);
                 exec(conn, "DELETE FROM customer_order WHERE id = " + id);
                 return null;
             });
         }
         db.inTransaction(conn -> {
-            exec(conn, "UPDATE customer_order SET delivery_run_id = NULL "
-                + "WHERE delivery_run_id IN (SELECT id FROM delivery_run WHERE staff_name LIKE 'QA%')");
-            exec(conn, "DELETE FROM delivery_run WHERE staff_name LIKE 'QA%'");
-            exec(conn, "DELETE FROM rider WHERE name LIKE 'QA %'");
             exec(conn, "DELETE FROM option_value WHERE option_group_id IN (SELECT id FROM option_group WHERE name LIKE 'QA %')");
             exec(conn, "UPDATE menu_item SET option_group_id = NULL "
                 + "WHERE option_group_id IN (SELECT id FROM option_group WHERE name LIKE 'QA %')");
@@ -144,13 +142,21 @@ public final class QA {
     public static int integritySweep(Db db, String label) throws DatabaseException {
         String[][] checks = {
             {"amount_paid exceeds total", "amount_paid > total"},
-            {"PAYMENT_RECEIVED but underpaid", "status='PAYMENT_RECEIVED' AND amount_paid < total"},
-            {"PENDING but has money", "status='PENDING' AND amount_paid > 0"},
-            {"PARTIALLY_PAID out of range", "status='PARTIALLY_PAID' AND (amount_paid <= 0 OR amount_paid >= total)"},
+            {"PAID but underpaid", "payment_status='PAID' AND amount_paid < total"},
+            {"UNPAID but has money", "payment_status='UNPAID' AND amount_paid > 0"},
+            {"PARTIALLY_PAID out of range", "payment_status='PARTIALLY_PAID' AND (amount_paid <= 0 OR amount_paid >= total)"},
+            // The two tracks are independent, so there is deliberately NO invariant
+            // forbidding a cancelled order from holding money — that is a real state
+            // (paid, then cancelled, awaiting refund). What must hold is that such an
+            // order is excluded from revenue, which the reconciliation checks cover.
+            {"unknown fulfilment state", "fulfilment_status NOT IN ('PENDING','COMPLETED','CANCELLED')"},
             {"total equation broken", "total <> subtotal - discount_total + tax_total + delivery_fee"},
             {"negative money", "subtotal < 0 OR total < 0 OR amount_paid < 0 OR discount_total < 0"},
             {"discount exceeds subtotal", "discount_total > subtotal"},
-            {"delivery missing address", "order_type='DELIVERY' AND (delivery_address IS NULL OR length(btrim(delivery_address)) < 10)"},
+            // The 10-character floor was dropped from the app (Validators.isValidAddress,
+            // Migrations#19) -- a short address like "Flat 3" is now legitimately valid,
+            // so this check follows the same rule: blank is the only violation.
+            {"delivery missing address", "order_type='DELIVERY' AND (delivery_address IS NULL OR length(btrim(delivery_address)) = 0)"},
             {"orphaned order_line", "id IN (SELECT order_id FROM order_line WHERE order_id NOT IN (SELECT id FROM customer_order))"},
         };
         int violations = 0;

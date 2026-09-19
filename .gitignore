@@ -4,3 +4,12 @@ db.properties
 backups/
 qa/bin/
 qa/run/db.properties
+RoyalPizzaSahowala.jar
+
+# installer/build and installer/third-party are large, reproducible staging areas
+# (jlink runtime, jpackage app-image, PostgreSQL binaries, VC++ redistributable) --
+# installer/fetch-dependencies.ps1 and installer/build-installer.ps1 regenerate them.
+# installer/out holds the final Setup.exe, also not source-controlled.
+installer/build/
+installer/third-party/
+installer/out/

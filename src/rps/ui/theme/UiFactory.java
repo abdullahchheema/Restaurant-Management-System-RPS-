@@ -235,17 +235,32 @@ public final class UiFactory {
 
     /** Low-saturation tinted tag: colored text + hairline border on a tinted ground,
      *  not a solid fill — the locked, more restrained status treatment. */
-    public static JLabel statusPill(rps.model.OrderStatus status) {
+    public static JLabel statusPill(rps.model.PaymentStatus status) {
         Color color = Theme.statusColor(status);
         rps.ui.icon.LineIcon icon = switch (status) {
-            case PENDING, PARTIALLY_PAID -> rps.ui.icon.LineIcon.STATUS_PENDING;
-            case PAYMENT_RECEIVED -> rps.ui.icon.LineIcon.STATUS_COMPLETED;
+            case UNPAID, PARTIALLY_PAID -> rps.ui.icon.LineIcon.STATUS_PENDING;
+            case PAID -> rps.ui.icon.LineIcon.STATUS_COMPLETED;
+        };
+        return pill(status.label(), icon, color, Theme.statusTint(status));
+    }
+
+    /** The kitchen/counter track — same visual treatment, different vocabulary, so the two
+     *  pills sit side by side on the dashboard without either being mistaken for the other. */
+    public static JLabel fulfilmentPill(rps.model.FulfilmentStatus status) {
+        Color color = Theme.fulfilmentColor(status);
+        rps.ui.icon.LineIcon icon = switch (status) {
+            case PENDING -> rps.ui.icon.LineIcon.STATUS_PENDING;
+            case COMPLETED -> rps.ui.icon.LineIcon.STATUS_COMPLETED;
             case CANCELLED -> rps.ui.icon.LineIcon.STATUS_CANCELLED;
         };
-        JLabel l = new JLabel(status.label(), icon.of(11, color), SwingConstants.CENTER);
+        return pill(status.label(), icon, color, Theme.fulfilmentTint(status));
+    }
+
+    private static JLabel pill(String text, rps.ui.icon.LineIcon icon, Color color, Color tint) {
+        JLabel l = new JLabel(text, icon.of(11, color), SwingConstants.CENTER);
         l.setIconTextGap(5);
         l.setOpaque(true);
-        l.setBackground(Theme.statusTint(status));
+        l.setBackground(tint);
         l.setForeground(color);
         l.setFont(Theme.FONT_SMALL_BOLD);
         l.setBorder(BorderFactory.createCompoundBorder(
@@ -265,8 +280,10 @@ public final class UiFactory {
             public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected,
                                                              boolean hasFocus, int row, int column) {
                 JLabel base = (JLabel) super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
-                if (value instanceof rps.model.OrderStatus status) {
-                    JLabel pill = statusPill(status);
+                if (value instanceof rps.model.PaymentStatus || value instanceof rps.model.FulfilmentStatus) {
+                    JLabel pill = value instanceof rps.model.PaymentStatus p
+                        ? statusPill(p)
+                        : fulfilmentPill((rps.model.FulfilmentStatus) value);
                     if (isSelected) {
                         pill.setBackground(Theme.PRIMARY_TINT);
                     }

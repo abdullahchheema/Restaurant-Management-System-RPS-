@@ -50,8 +50,16 @@ public final class R1Repro {
 
         System.out.printf("    live draft passed to worker (old behaviour): %d/%d orders torn%n", tornLive, runs);
         System.out.printf("    snapshot passed to worker (fixed behaviour): %d/%d orders torn%n", tornSnap, runs);
-        check("R1-A-REPRO", "Old behaviour is genuinely broken (control)", tornLive > 0,
-            tornLive + "/" + runs + " torn — confirms the defect is real");
+        // Reported, not asserted. This line is a CONTROL: it deliberately drives the old
+        // unsafe path to show the defect was real. Whether a data race actually manifests
+        // is down to thread scheduling — measured at roughly 1 tear per 40 attempts, which
+        // makes "zero tears this run" a perfectly ordinary outcome (about a third of runs)
+        // and says nothing whatever about the product. Asserting on it made the suite fail
+        // at random, which is worse than not checking: a gate that cries wolf gets ignored.
+        // The assertion that matters is R1-A-FIX below — it is the one that would catch a
+        // regression in snapshot(), and it is deterministic.
+        System.out.printf("    control: old behaviour torn %d/%d (probabilistic — 0 is normal)%n",
+            tornLive, runs);
         check("R1-A-FIX", "snapshot() isolates the save from later edits",
             tornSnap == 0, tornSnap + "/" + runs + " torn");
 

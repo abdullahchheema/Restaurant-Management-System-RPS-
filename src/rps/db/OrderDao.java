@@ -5,7 +5,8 @@ import rps.model.DraftLine;
 import rps.model.Order;
 import rps.model.OrderDraft;
 import rps.model.OrderLine;
-import rps.model.OrderStatus;
+import rps.model.FulfilmentStatus;
+import rps.model.PaymentStatus;
 import rps.model.OrderTotals;
 import rps.model.OrderType;
 import rps.util.Money;
@@ -49,18 +50,33 @@ public final class OrderDao {
     /** Whether a confirmed order can still be edited from the dashboard — anything short
      *  of CANCELLED (a cancelled order has nothing left to edit) and within the
      *  configurable edit window of its creation time. A PENDING order is editable, same
-     *  as a PAYMENT_RECEIVED one — editing it may raise or lower its total and therefore
-     *  its status, which updateOrder re-derives after saving. Time-based, so it can only
+     *  as a paid one — editing it may raise or lower its total and therefore its payment
+     *  status, which updateOrder re-derives after saving. Time-based, so it can only
      *  be enforced here and in updateOrder itself — Postgres CHECK constraints reject
      *  non-immutable functions like now(), so this can't also live as a DB constraint the
      *  way phone-required or the discount clamp do. */
     public static boolean canEdit(Order order) {
-        if (order.status() == OrderStatus.CANCELLED) return false;
+        if (order.fulfilmentStatus().isCancelled()) return false;
         int windowMinutes = rps.util.AppSettings.get().orderEditWindowMinutes();
         OffsetDateTime deadline = order.createdAt().plusMinutes(windowMinutes);
         // OffsetDateTime.isBefore compares by instant, not local wall-clock, so the two
         // offsets don't need to match for this to be correct.
         return OffsetDateTime.now().isBefore(deadline);
+    }
+
+    /**
+     * Whether more items can still be ADDED to an order — which is a different question
+     * from whether it can be {@link #canEdit edited}, and deliberately outlives it.
+     *
+     * <p>The edit window exists to stop what has already been sent to the kitchen and
+     * charged for being rewritten after the fact. It was never meant to stop a customer
+     * ordering a second round: a table that ate an hour ago and wants more food is placing
+     * an addition, not retroactively altering history. So once the window closes the
+     * existing lines freeze, but the order stays open to additions for as long as it is
+     * live — only cancellation closes it for good.
+     */
+    public static boolean canAddItems(Order order) {
+        return order.fulfilmentStatus().isLive();
     }
 
     private record PricedVariant(int variantId, int menuItemId, String itemName, String sizeLabel, Money price) {}
@@ -72,10 +88,11 @@ public final class OrderDao {
      * stored totals (including discount) are rolled up from the rows actually written
      * and the discount mode/value in ONE SQL statement — never summed or discounted in
      * Java — so the exact-equality CHECK on customer_order can never be violated by a
-     * Java/SQL rounding disagreement. The order is saved PENDING; a full (or overpaid)
-     * cash amount immediately settles it to PAYMENT_RECEIVED, a short or absent amount
-     * leaves it PENDING for a later rps.db.OrderDao#recordPayment. Returns the order
-     * re-read from the database, which both receipts render from.
+     * Java/SQL rounding disagreement. The order is saved UNPAID and PENDING; a full (or
+     * overpaid) cash amount immediately moves the payment track to PAID, a short or absent
+     * amount leaves a balance for a later rps.db.OrderDao#recordPayment. Fulfilment always
+     * starts PENDING — cash arriving with the order says nothing about whether the kitchen
+     * has made it. Returns the order re-read from the database, which both receipts render.
      */
     public Order saveOrder(OrderDraft liveDraft, int staffId, String staffName) throws DatabaseException {
         // Defence in depth: our own immutable copy before anything reads it. The UI also
@@ -117,7 +134,7 @@ public final class OrderDao {
             long orderId;
             try (PreparedStatement ps = conn.prepareStatement("""
                     INSERT INTO customer_order
-                        (order_number, business_date, order_type, status, staff_id, staff_name,
+                        (order_number, business_date, order_type, payment_status, staff_id, staff_name,
                          table_number, customer_name, customer_phone, delivery_address, notes, completed_at,
                          discount_mode, discount_rate)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?, NULL, ?, ?)
@@ -126,7 +143,9 @@ public final class OrderDao {
                 ps.setString(1, orderNumber);
                 ps.setObject(2, bizDate);
                 ps.setString(3, draft.type().name());
-                ps.setString(4, OrderStatus.PENDING.name());
+                // fulfilment_status is left to its column default of PENDING — a brand-new
+                // order is always still being prepared, whatever cash arrives with it.
+                ps.setString(4, PaymentStatus.UNPAID.name());
                 ps.setInt(5, staffId);
                 ps.setString(6, staffName);
                 setNullableString(ps, 7, draft.tableNumber());
@@ -146,7 +165,7 @@ public final class OrderDao {
                 }
             }
 
-            insertLines(conn, orderId, draft.lines(), priced, pricedOptions);
+            insertLines(conn, orderId, draft.lines(), priced, pricedOptions, 0);
             rollupTotals(conn, orderId, draft.type(), mode, discountValue);
 
             applyPayment(conn, orderId, cashPaid, staffId, null);
@@ -227,17 +246,89 @@ public final class OrderDao {
                 ps.executeUpdate();
             }
 
-            insertLines(conn, orderId, draft.lines(), priced, pricedOptions);
+            insertLines(conn, orderId, draft.lines(), priced, pricedOptions, 0);
             rollupTotals(conn, orderId, draft.type(), mode, discountValue);
 
-            applyPayment(conn, orderId, cashPaid, staffId, current.status());
+            applyPayment(conn, orderId, cashPaid, staffId, current.paymentStatus());
 
             return loadOrderForPrint(conn, orderId);
         });
     }
 
+    /**
+     * Appends items to an order whose existing lines are frozen — the "second round" path
+     * that stays open after the edit window has closed (see {@link #canAddItems}).
+     *
+     * <p>Deliberately not expressed as updateOrder with a longer line list: updateOrder
+     * deletes every line and rewrites them, which is exactly the operation the closed edit
+     * window is meant to prevent. This only ever INSERTs, so nothing already sent to the
+     * kitchen or already charged for can be altered or removed by this path, whatever the
+     * caller passes.
+     *
+     * <p>Totals are re-rolled by the same rollupTotals used everywhere else, and the payment
+     * status re-derived against the new, higher total: adding to a fully-paid order
+     * correctly moves it back to Partially Paid with a balance owing. The order's type,
+     * contact details and discount are untouched — only lines and the money that follows
+     * from them. An AMOUNT discount is re-applied from the stored discount_total (the raw
+     * figure the cashier originally typed was never persisted), matching how
+     * OrderEditDialog reopens one.
+     */
+    public Order addItemsToOrder(long orderId, List<DraftLine> newLines, Money additionalCash,
+                                  int staffId, String staffName) throws DatabaseException {
+        final List<DraftLine> lines = List.copyOf(newLines);   // same isolation reasoning as saveOrder
+        if (lines.isEmpty()) {
+            throw new DatabaseException("Add at least one item.");
+        }
+        return db.inTransaction(conn -> {
+            Order current = loadOrderForPrint(conn, orderId);
+            if (current == null) {
+                throw new DatabaseException("This order no longer exists.");
+            }
+            if (!canAddItems(current)) {
+                throw new DatabaseException("This order was cancelled — nothing more can be added to it.");
+            }
+
+            List<Integer> variantIds = lines.stream().map(DraftLine::variantId).toList();
+            Map<Integer, PricedVariant> priced = fetchOrderableVariants(conn, variantIds);
+            for (Integer vid : variantIds) {
+                if (!priced.containsKey(vid)) {
+                    throw new DatabaseException("An item being added is no longer available.");
+                }
+            }
+            List<Integer> optionIds = lines.stream().map(DraftLine::optionValueId)
+                .filter(java.util.Objects::nonNull).toList();
+            Map<Integer, PricedOption> pricedOptions = fetchOrderableOptions(conn, optionIds);
+            validateLineOptions(conn, lines, priced, pricedOptions);
+
+            int maxLineNo;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT COALESCE(MAX(line_no), 0) FROM order_line WHERE order_id = ?")) {
+                ps.setLong(1, orderId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    rs.next();
+                    maxLineNo = rs.getInt(1);
+                }
+            }
+            insertLines(conn, orderId, lines, priced, pricedOptions, maxLineNo);
+
+            BigDecimal discountValue = switch (current.discountMode()) {
+                case PERCENT -> current.discountRate();
+                case AMOUNT -> current.totals().discountTotal().asBigDecimal();
+                case NONE -> null;
+            };
+            rollupTotals(conn, orderId, current.type(), current.discountMode(), discountValue);
+            applyPayment(conn, orderId, additionalCash, staffId, current.paymentStatus());
+
+            return loadOrderForPrint(conn, orderId);
+        });
+    }
+
+    /** {@code startLineNo} is 0 when writing an order's lines from scratch; appending to an
+     *  existing order passes the highest line_no already stored, so added lines continue
+     *  the numbering instead of colliding with what is already there. */
     private void insertLines(Connection conn, long orderId, List<DraftLine> lines,
-                              Map<Integer, PricedVariant> priced, Map<Integer, PricedOption> pricedOptions)
+                              Map<Integer, PricedVariant> priced, Map<Integer, PricedOption> pricedOptions,
+                              int startLineNo)
             throws SQLException, DatabaseException {
         try (PreparedStatement ps = conn.prepareStatement("""
                 INSERT INTO order_line
@@ -245,7 +336,7 @@ public final class OrderDao {
                      notes, option_value_id, option_group_name, option_value_name)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """)) {
-            int lineNo = 0;
+            int lineNo = startLineNo;
             for (DraftLine l : lines) {
                 PricedVariant v = priced.get(l.variantId());
                 PricedOption o = l.optionValueId() == null ? null : pricedOptions.get(l.optionValueId());
@@ -490,19 +581,17 @@ public final class OrderDao {
      * Applies a cash amount collected at confirm/edit time to amount_paid (capped at the
      * server total — any excess is change, not extra revenue), accumulates cash_tendered
      * so the receipt's Cash/Change lines reflect everything handed over across all
-     * payments, and derives the resulting status: PAYMENT_RECEIVED once amount_paid
-     * reaches total, otherwise PENDING. {@code fromStatus} is null for a brand-new order
+     * payments, and derives the resulting payment status: PAID once amount_paid reaches
+     * total, PARTIALLY_PAID while some is in, otherwise UNPAID. The fulfilment track is
+     * never touched here. {@code fromStatus} is null for a brand-new order
      * (no prior status to transition from in the history log); for an edit it's the
      * order's status before this save, so the transition is recorded even when the
      * amount entered is null (e.g. the total changed enough on its own to cross the
      * paid/pending line).
      *
-     * <p>Package-private (not private) so DeliveryDao can settle each order in a
-     * completed delivery run against the same connection/transaction it's already
-     * running, rather than re-implementing this same status-derivation logic.
      */
-    OrderStatus applyPayment(Connection conn, long orderId, Money cashPaid, Integer staffId,
-                              OrderStatus fromStatus) throws SQLException {
+    private PaymentStatus applyPayment(Connection conn, long orderId, Money cashPaid, Integer staffId,
+                              PaymentStatus fromStatus) throws SQLException {
         Money serverTotal = readTotal(conn, orderId);
         Money alreadyPaid = readAmountPaid(conn, orderId);
 
@@ -547,27 +636,45 @@ public final class OrderDao {
         // forever — no payment could ever satisfy them, since amount_paid is capped at
         // the total, so they never counted as revenue and never left the Pending pane.
         // rollupTotals always runs before this, so `total` is authoritative by now.
-        OrderStatus resolved;
+        PaymentStatus resolved;
         if (alreadyPaid.compareTo(serverTotal) >= 0) {
-            resolved = OrderStatus.PAYMENT_RECEIVED;
+            resolved = PaymentStatus.PAID;
         } else if (alreadyPaid.isPositive()) {
-            resolved = OrderStatus.PARTIALLY_PAID;
+            resolved = PaymentStatus.PARTIALLY_PAID;
         } else {
-            resolved = OrderStatus.PENDING;
+            resolved = PaymentStatus.UNPAID;
         }
 
         if (fromStatus == null || fromStatus != resolved) {
-            try (PreparedStatement ps = conn.prepareStatement("""
-                    UPDATE customer_order
-                    SET status = ?, completed_at = CASE WHEN ? THEN now() ELSE completed_at END
-                    WHERE id = ?
-                    """)) {
+            // completed_at is no longer touched here. It marks when the order was handed
+            // to the customer, which is a fulfilment event — money arriving says nothing
+            // about whether the food has gone out, and conflating the two is exactly what
+            // this split exists to undo. setFulfilment stamps it instead.
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE customer_order SET payment_status = ? WHERE id = ?")) {
                 ps.setString(1, resolved.name());
-                ps.setBoolean(2, resolved == OrderStatus.PAYMENT_RECEIVED);
-                ps.setLong(3, orderId);
+                ps.setLong(2, orderId);
                 ps.executeUpdate();
             }
-            recordStatusChange(conn, orderId, fromStatus, resolved, staffId);
+            recordStatusChange(conn, orderId, StatusKind.PAYMENT,
+                fromStatus == null ? null : fromStatus.name(), resolved.name(), staffId);
+        }
+
+        // A debt collected in full stops being a debt: it leaves the Pay Later ledger here
+        // and reappears on the Dashboard as an ordinary settled order. Done in applyPayment
+        // rather than in recordPayment alone so EVERY route to "fully paid" settles it —
+        // there must be no way to end up with a paid order still sitting on the ledger.
+        //
+        // Revenue does not move as a result: the total was already recognised when credit
+        // was given, and dailySummary's (payment_status = 'PAID' OR loan_at IS NOT NULL)
+        // matches this row exactly once both before and after this statement.
+        if (resolved == PaymentStatus.PAID) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE customer_order SET loan_settled_at = now() WHERE id = ? AND "
+                    + ON_LEDGER)) {
+                ps.setLong(1, orderId);
+                ps.executeUpdate();
+            }
         }
         return resolved;
     }
@@ -575,7 +682,12 @@ public final class OrderDao {
     /**
      * Records an additional cash payment against a still-Pending order from the
      * Dashboard, moving it to PARTIALLY_PAID or, once amount_paid reaches the total,
-     * PAYMENT_RECEIVED. Optimistic on the caller's last-seen status, same shape as
+     * PAID. Two different refusals on purpose: an order that is merely already settled
+     * returns false (benign — another terminal got there first, just refresh), while a
+     * CANCELLED order throws, because taking cash against a voided order is a mistake the
+     * cashier must be told about — that money would never reach the books, cancelled
+     * orders being excluded from revenue. Optimistic on the caller's last-seen status,
+     * same shape as
      * updateStatus: returns false if the order is no longer awaiting payment (cancelled
      * or already settled by another terminal) rather than silently applying a payment
      * to the wrong state. A part-paid order accepts further payments, so the guard is
@@ -586,13 +698,19 @@ public final class OrderDao {
             throw new DatabaseException("Enter an amount greater than zero.");
         }
         return db.inTransaction(conn -> {
-            OrderStatus current;
+            PaymentStatus current;
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT status FROM customer_order WHERE id = ? FOR UPDATE")) {
+                    "SELECT payment_status, fulfilment_status FROM customer_order WHERE id = ? FOR UPDATE")) {
                 ps.setLong(1, orderId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) throw new DatabaseException("This order no longer exists.");
-                    current = OrderStatus.valueOf(rs.getString(1));
+                    current = PaymentStatus.valueOf(rs.getString(1));
+                    // A cancelled order collects nothing more, whatever its payment row
+                    // says — money taken against one would never appear in the takings,
+                    // since revenue excludes cancelled orders entirely.
+                    if (FulfilmentStatus.valueOf(rs.getString(2)).isCancelled()) {
+                        throw new DatabaseException("This order was cancelled — no further payment can be recorded.");
+                    }
                     if (!current.awaitsPayment()) {
                         return false;
                     }
@@ -603,66 +721,177 @@ public final class OrderDao {
         });
     }
 
-    private void recordStatusChange(Connection conn, long orderId, OrderStatus from, OrderStatus to, Integer staffId)
-            throws SQLException {
+    /** Which of the two independent tracks a history row describes. */
+    private enum StatusKind { PAYMENT, FULFILMENT }
+
+    private void recordStatusChange(Connection conn, long orderId, StatusKind kind,
+                                     String from, String to, Integer staffId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement("""
-                INSERT INTO order_status_history (order_id, from_status, to_status, staff_id)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO order_status_history (order_id, status_kind, from_status, to_status, staff_id)
+                VALUES (?, ?, ?, ?, ?)
                 """)) {
             ps.setLong(1, orderId);
-            if (from == null) ps.setNull(2, Types.VARCHAR); else ps.setString(2, from.name());
-            ps.setString(3, to.name());
-            if (staffId == null) ps.setNull(4, Types.INTEGER); else ps.setInt(4, staffId);
+            ps.setString(2, kind.name());
+            if (from == null) ps.setNull(3, Types.VARCHAR); else ps.setString(3, from);
+            ps.setString(4, to);
+            if (staffId == null) ps.setNull(5, Types.INTEGER); else ps.setInt(5, staffId);
             ps.executeUpdate();
         }
     }
 
     /**
-     * Advances an order's status with optimistic concurrency: the update only applies if
-     * the order is still in the status the caller last saw. Returns false if another
-     * terminal already changed it (caller should refresh and inform the user). Used for
-     * cancellation from the dashboard — PENDING and PAYMENT_RECEIVED can both be
-     * cancelled (OrderStatus.canCancel()).
+     * How long after it was placed an order can still be cancelled without the Force
+     * Cancel override. Separate setting from the edit window — see
+     * AppSettings#orderCancelWindowMinutes. Applies regardless of whether the customer has
+     * paid; paying does not buy more time to change your mind, and not paying does not
+     * leave the order voidable forever.
      */
-    public boolean updateStatus(long orderId, OrderStatus expectedCurrent, OrderStatus newStatus, Integer staffId)
+    public static boolean withinCancelWindow(Order order) {
+        int minutes = rps.util.AppSettings.get().orderCancelWindowMinutes();
+        return OffsetDateTime.now().isBefore(order.createdAt().plusMinutes(minutes));
+    }
+
+    /** Whether the plain Cancel action applies: a live order still inside its window. */
+    public static boolean canCancel(Order order) {
+        return order.fulfilmentStatus().isLive() && withinCancelWindow(order);
+    }
+
+    /**
+     * Moves the fulfilment track — the kitchen/counter state — with optimistic
+     * concurrency: the update only applies if the order is still in the state the caller
+     * last saw, so a second terminal that already changed it returns false rather than
+     * silently overwriting. Payment is untouched; cancelling an order that was paid leaves
+     * it visibly paid, and it simply stops counting toward revenue.
+     *
+     * <p>{@code force} bypasses only the time window, never the state machine: a cancelled
+     * order stays cancelled, and COMPLETED still cannot walk back to PENDING. Every forced
+     * cancellation is written to order_status_history against the staff member who did it,
+     * which is the whole point of having the override be explicit rather than just
+     * widening the window.
+     */
+    public boolean updateFulfilment(long orderId, FulfilmentStatus expectedCurrent,
+                                     FulfilmentStatus newStatus, Integer staffId, boolean force)
             throws DatabaseException {
-        // State-machine guard. The optimistic WHERE clause below only checks that the row
-        // still holds `expectedCurrent`; it does not check that the move is legal, so a
-        // caller passing CANCELLED -> PAYMENT_RECEIVED was accepted outright (reproduced
-        // as TEST035). Resurrecting a cancelled order would silently put its total back
-        // into revenue, so the rule is enforced here rather than trusted to callers.
         if (!expectedCurrent.canTransitionTo(newStatus)) {
             throw new DatabaseException("Cannot change an order from "
                 + expectedCurrent.label() + " to " + newStatus.label() + ".");
         }
         return db.inTransaction(conn -> {
-            boolean isCompleted = newStatus == OrderStatus.PAYMENT_RECEIVED;
+            if (newStatus == FulfilmentStatus.CANCELLED) {
+                return cancelOrder(conn, orderId, expectedCurrent, force);
+            }
             try (PreparedStatement ps = conn.prepareStatement("""
                     UPDATE customer_order
-                    SET status = ?, completed_at = CASE WHEN ? THEN now() ELSE completed_at END
-                    WHERE id = ? AND status = ?
+                    SET fulfilment_status = ?,
+                        completed_at = CASE WHEN ? THEN now() ELSE completed_at END
+                    WHERE id = ? AND fulfilment_status = ?
                     """)) {
                 ps.setString(1, newStatus.name());
-                ps.setBoolean(2, isCompleted);
+                ps.setBoolean(2, newStatus == FulfilmentStatus.COMPLETED);
                 ps.setLong(3, orderId);
                 ps.setString(4, expectedCurrent.name());
-                int updated = ps.executeUpdate();
-                if (updated == 0) {
+                if (ps.executeUpdate() == 0) {
                     return false;
                 }
             }
-            recordStatusChange(conn, orderId, expectedCurrent, newStatus, staffId);
+            recordStatusChange(conn, orderId, StatusKind.FULFILMENT,
+                expectedCurrent.name(), newStatus.name(), staffId);
             return true;
+        });
+    }
+
+    /**
+     * Cancelling an order deletes it outright rather than marking it CANCELLED and
+     * keeping the row — a deliberate choice: a cancelled order should leave no trace
+     * anywhere in the system (not in Total Orders, not in Reports, not in the Pay Later
+     * ledger if it happened to be on account), rather than persisting as a voided record.
+     *
+     * <p>The tradeoff, made knowingly: there is no audit trail of a cancellation
+     * surviving this call, and the next order still takes the next sequential number, so
+     * a cancelled order leaves a gap (e.g. #005 then #007) with nothing in the system to
+     * explain it. Optimistic concurrency is preserved the same way the UPDATE path in
+     * {@link #updateFulfilment} checks it: the DELETE only matches if the order is still
+     * in the exact fulfilment state the caller last saw.
+     */
+    private boolean cancelOrder(Connection conn, long orderId, FulfilmentStatus expectedCurrent, boolean force)
+            throws SQLException, DatabaseException {
+        // Re-checked inside the transaction rather than trusted from the caller: the
+        // dashboard decides which buttons to show minutes before anyone clicks one.
+        if (!force) {
+            Order current = loadOrderForPrint(conn, orderId);
+            // Already gone -- most likely a concurrent cancel (another terminal, or a
+            // double-click) beat this call to it. Same "someone else already changed it,
+            // refresh and try again" shape as every other optimistic-concurrency check in
+            // this class, not a hard error: the caller's own goal — this order being
+            // gone — is already achieved either way.
+            if (current == null) return false;
+            if (!withinCancelWindow(current)) {
+                throw new DatabaseException("This order can no longer be cancelled — the "
+                    + rps.util.AppSettings.get().orderCancelWindowMinutes()
+                    + "-minute cancellation window has passed. Use Force Cancel if it really must be voided.");
+            }
+        }
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM order_status_history WHERE order_id = ?")) {
+            ps.setLong(1, orderId);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM order_line WHERE order_id = ?")) {
+            ps.setLong(1, orderId);
+            ps.executeUpdate();
+        }
+        try (PreparedStatement ps = conn.prepareStatement(
+                "DELETE FROM customer_order WHERE id = ? AND fulfilment_status = ?")) {
+            ps.setLong(1, orderId);
+            ps.setString(2, expectedCurrent.name());
+            return ps.executeUpdate() == 1;
+        }
+    }
+
+    /**
+     * Wipes every order and delivery record while leaving staff accounts and the menu
+     * completely untouched — the triple-confirmed "Reset All Data" action in Settings,
+     * for a manager who wants the till's books to start over (a demo period ending, a
+     * till changing hands) without reinstalling anything. TRUNCATE, not DELETE, so the
+     * daily order-sequence and every id resets too and the next order genuinely numbers
+     * -001 again — the same operation reset-for-handover.ps1 already performs from
+     * outside the app before a client handover; this exposes it from inside the running
+     * app for a manager to use on their own machine afterwards. RESTART IDENTITY CASCADE
+     * requires no FK-order juggling: category/menu_item/staff are never touched, so
+     * nothing here can cascade into them.
+     */
+    public void resetAllTradingData() throws DatabaseException {
+        db.inTransaction(conn -> {
+            try (Statement st = conn.createStatement()) {
+                st.execute("""
+                    TRUNCATE TABLE
+                        order_status_history, order_line, customer_order, daily_counter
+                    RESTART IDENTITY CASCADE
+                    """);
+            }
+            return null;
         });
     }
 
     // ---------------------------------------------------------------- reads
 
+    /**
+     * What it means for an order to be a live debt on the Pay Later ledger, written once so
+     * the Dashboard and the ledger can never disagree about which of them owns a row.
+     *
+     * <p>Collected in full, an order settles: it leaves the ledger and goes back to the
+     * Dashboard. {@link #ON_LEDGER} and {@link #OFF_LEDGER} are exact complements, so every
+     * order is always in exactly one of the two screens — never both, never neither.
+     */
+    private static final String ON_LEDGER = "(loan_at IS NOT NULL AND loan_settled_at IS NULL)";
+    private static final String OFF_LEDGER = "(loan_at IS NULL OR loan_settled_at IS NOT NULL)";
+    private static final String ON_LEDGER_CO = "(co.loan_at IS NOT NULL AND co.loan_settled_at IS NULL)";
+    private static final String OFF_LEDGER_CO = "(co.loan_at IS NULL OR co.loan_settled_at IS NOT NULL)";
+
     private static final String ORDER_COLUMNS = """
-        id, order_number, business_date, order_type, status, staff_id, staff_name,
+        id, order_number, business_date, order_type, payment_status, fulfilment_status, staff_id, staff_name,
         created_at, updated_at, completed_at, subtotal, discount_total, tax_total,
         delivery_fee, total, discount_mode, discount_rate, cash_tendered, amount_paid,
-        table_number, customer_name, customer_phone, delivery_address, notes
+        table_number, customer_name, customer_phone, delivery_address, notes, loan_at, loan_settled_at
         """;
 
     public Order loadOrderForPrint(long orderId) throws DatabaseException {
@@ -695,20 +924,24 @@ public final class OrderDao {
         return header.withLines(lines);
     }
 
-    public record OrderFilter(OrderType type, OrderStatus status, LocalDate from, LocalDate to) {
+    /** Either status may be null, meaning "any" — the dashboard filters the two tracks
+     *  independently, e.g. "still being prepared" crossed with "already paid". */
+    public record OrderFilter(OrderType type, PaymentStatus paymentStatus,
+                              FulfilmentStatus fulfilmentStatus, LocalDate from, LocalDate to) {
         public static OrderFilter todayAllTypes() {
             LocalDate today = businessDate(ZonedDateTime.now());
-            return new OrderFilter(null, null, today, today);
+            return new OrderFilter(null, null, null, today, today);
         }
     }
 
     public record OrderRow(Order order, int itemCount) {}
 
     private static final String ORDER_COLUMNS_PREFIXED = """
-        co.id, co.order_number, co.business_date, co.order_type, co.status, co.staff_id, co.staff_name,
+        co.id, co.order_number, co.business_date, co.order_type, co.payment_status, co.fulfilment_status, co.staff_id, co.staff_name,
         co.created_at, co.updated_at, co.completed_at, co.subtotal, co.discount_total, co.tax_total,
         co.delivery_fee, co.total, co.discount_mode, co.discount_rate, co.cash_tendered, co.amount_paid,
-        co.table_number, co.customer_name, co.customer_phone, co.delivery_address, co.notes
+        co.table_number, co.customer_name, co.customer_phone, co.delivery_address, co.notes,
+        co.loan_at, co.loan_settled_at
         """;
 
     /** For the dashboard's live list. Reads on the read-only connection. */
@@ -717,7 +950,11 @@ public final class OrderDao {
             "SELECT " + ORDER_COLUMNS_PREFIXED + ", COALESCE(lc.n, 0) AS item_count "
             + "FROM customer_order co "
             + "LEFT JOIN (SELECT order_id, COUNT(*) AS n FROM order_line GROUP BY order_id) lc "
-            + "ON lc.order_id = co.id WHERE co.business_date BETWEEN ? AND ?");
+            // Moving an order to "pay later" moves it OFF this screen entirely — it is no
+            // longer something the counter settles, it is a debt tracked in the Pay Later
+            // ledger (loadLoanOrders). Collected in full it settles and comes straight back
+            // here as an ordinary paid order, which is what OFF_LEDGER's second half allows.
+            + "ON lc.order_id = co.id WHERE " + OFF_LEDGER_CO + " AND co.business_date BETWEEN ? AND ?");
         List<Object> params = new ArrayList<>();
         params.add(filter.from());
         params.add(filter.to());
@@ -725,9 +962,13 @@ public final class OrderDao {
             sql.append(" AND co.order_type = ?");
             params.add(filter.type().name());
         }
-        if (filter.status() != null) {
-            sql.append(" AND co.status = ?");
-            params.add(filter.status().name());
+        if (filter.paymentStatus() != null) {
+            sql.append(" AND co.payment_status = ?");
+            params.add(filter.paymentStatus().name());
+        }
+        if (filter.fulfilmentStatus() != null) {
+            sql.append(" AND co.fulfilment_status = ?");
+            params.add(filter.fulfilmentStatus().name());
         }
         sql.append(" ORDER BY co.created_at DESC");
 
@@ -753,18 +994,23 @@ public final class OrderDao {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT count(*)::text || ':' || COALESCE(max(updated_at)::text, '-')
                     FROM customer_order
-                    WHERE business_date BETWEEN ? AND ?
+                    WHERE """ + OFF_LEDGER + """
+                      AND business_date BETWEEN ? AND ?
                       AND (? IS NULL OR order_type = ?)
-                      AND (? IS NULL OR status = ?)
+                      AND (? IS NULL OR payment_status = ?)
+                      AND (? IS NULL OR fulfilment_status = ?)
                     """)) {
                 ps.setObject(1, filter.from());
                 ps.setObject(2, filter.to());
                 String type = filter.type() == null ? null : filter.type().name();
                 ps.setString(3, type);
                 ps.setString(4, type);
-                String status = filter.status() == null ? null : filter.status().name();
-                ps.setString(5, status);
-                ps.setString(6, status);
+                String pay = filter.paymentStatus() == null ? null : filter.paymentStatus().name();
+                ps.setString(5, pay);
+                ps.setString(6, pay);
+                String ful = filter.fulfilmentStatus() == null ? null : filter.fulfilmentStatus().name();
+                ps.setString(7, ful);
+                ps.setString(8, ful);
                 try (ResultSet rs = ps.executeQuery()) {
                     rs.next();
                     return rs.getString(1);
@@ -787,45 +1033,227 @@ public final class OrderDao {
      * same WHERE clause as loadOrders and fingerprint — so the order count always agrees
      * with the table beneath it.
      *
-     * <p>Revenue and outstanding, however, are additionally restricted by status
-     * (PAYMENT_RECEIVED / anything still awaiting payment respectively) regardless of
-     * the dropdown's own status filter. Note outstanding sums total - amount_paid, so a
-     * PARTIALLY_PAID order contributes only the balance still owed, not its whole
-     * total. Cancelled is excluded from both because it is money never collected and never
-     * will be — summing it into either card overstates the day's actual takings or its
-     * actual exposure (verified: one sample day read Rs 52,333 against Rs 37,284
-     * actually collected, back when the only excluded status was Cancelled). Filtering
-     * the dashboard TO Cancelled therefore shows that status's order count with both
-     * cards at Rs 0.00, which is the truthful figure, and keeps this screen reconciling
-     * with the Reports tab, which is PAYMENT_RECEIVED-only.
+     * <p>Revenue and outstanding, however, are additionally restricted by payment state
+     * (PAID / anything still awaiting payment respectively) regardless of the dropdown's
+     * own filters. Note outstanding sums total - amount_paid, so a partly-paid order
+     * contributes only the balance still owed, not its whole total.
+     *
+     * <p>A CANCELLED order is excluded from all three figures, including order_count — a
+     * voided order was never really "an order" from the shop's point of view, and Total
+     * Orders is meant to read as a count of real trade, not a count of rows in the table.
+     * Cancelling means the money goes back too, so counting it toward revenue would
+     * overstate the day's takings against what is actually in the till. Filtering the
+     * dashboard TO Cancelled still shows those rows (and their own count) — this is what
+     * decides the summary CARDS, not what the table itself can display.
+     *
+     * <p>A LOAN (pay-later) order counts as revenue the moment credit is given, even though
+     * none of the cash has arrived, and stops counting as outstanding — the money owed is
+     * tracked as a receivable by the Pay Later screen instead ({@link #loanSummary}). It is
+     * also excluded from order_count, because it is no longer one of the rows listed
+     * beneath these cards. The OR in the revenue filter cannot double-count a loan that is
+     * later paid off in full: the row matches the filter once either way.
      */
     public DailySummary dailySummary(OrderFilter filter) throws DatabaseException {
         return db.inReadOnly(conn -> {
             try (PreparedStatement ps = conn.prepareStatement("""
                     SELECT
-                        count(*) AS order_count,
-                        COALESCE(SUM(total) FILTER (WHERE status = 'PAYMENT_RECEIVED'), 0) AS revenue,
-                        COALESCE(SUM(total - amount_paid)
-                            FILTER (WHERE status IN ('PENDING','PARTIALLY_PAID')), 0) AS outstanding
+                        count(*) FILTER (WHERE (fulfilment_status <> 'CANCELLED' OR ? = 'CANCELLED')
+                              AND """ + OFF_LEDGER + """
+                        ) AS order_count,
+                        COALESCE(SUM(total) FILTER (
+                            WHERE (payment_status = 'PAID' OR loan_at IS NOT NULL)
+                              AND fulfilment_status <> 'CANCELLED'), 0) AS revenue,
+                        COALESCE(SUM(total - amount_paid) FILTER (
+                            WHERE payment_status IN ('UNPAID','PARTIALLY_PAID')
+                              AND fulfilment_status <> 'CANCELLED'
+                              AND """ + OFF_LEDGER + """
+                        ), 0) AS outstanding
                     FROM customer_order
                     WHERE business_date BETWEEN ? AND ?
                       AND (? IS NULL OR order_type = ?)
-                      AND (? IS NULL OR status = ?)
+                      AND (? IS NULL OR payment_status = ?)
+                      AND (? IS NULL OR fulfilment_status = ?)
                     """)) {
-                ps.setObject(1, filter.from());
-                ps.setObject(2, filter.to());
+                String ful = filter.fulfilmentStatus() == null ? null : filter.fulfilmentStatus().name();
+                // Bound twice: once here to decide whether order_count still excludes
+                // CANCELLED rows (it does, UNLESS the dashboard is explicitly filtered to
+                // Cancelled — then the count of "how many cancelled orders" is exactly
+                // what that view is for, and showing 0 while the table below lists several
+                // would look like a bug), and again further down as the ordinary WHERE
+                // filter every other query on this page already applies.
+                ps.setString(1, ful);
+                ps.setObject(2, filter.from());
+                ps.setObject(3, filter.to());
                 String type = filter.type() == null ? null : filter.type().name();
-                ps.setString(3, type);
                 ps.setString(4, type);
-                String status = filter.status() == null ? null : filter.status().name();
-                ps.setString(5, status);
-                ps.setString(6, status);
+                ps.setString(5, type);
+                String pay = filter.paymentStatus() == null ? null : filter.paymentStatus().name();
+                ps.setString(6, pay);
+                ps.setString(7, pay);
+                ps.setString(8, ful);
+                ps.setString(9, ful);
                 try (ResultSet rs = ps.executeQuery()) {
                     rs.next();
                     return new DailySummary(rs.getLong("order_count"),
                         Money.of(rs.getBigDecimal("revenue")),
                         Money.of(rs.getBigDecimal("outstanding")));
                 }
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- pay later (loans)
+
+    /**
+     * Moves an order off the Dashboard and onto the Pay Later ledger: the customer is
+     * leaving without settling, by agreement. From this moment the order's total counts as
+     * revenue and stops counting as outstanding (see {@link #dailySummary}), while the
+     * balance still owed becomes a receivable listed in the Pay Later screen.
+     *
+     * <p>Refuses rather than silently no-ops on the two states where credit makes no sense:
+     * a cancelled order (there is no debt — also enforced by ck_loan_not_cancelled) and an
+     * already fully-paid one (there is nothing to owe). Returns false if another terminal
+     * already moved it, matching updateFulfilment/recordPayment's optimistic shape.
+     */
+    public boolean moveToLoan(long orderId, Integer staffId) throws DatabaseException {
+        return db.inTransaction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT payment_status, fulfilment_status, loan_at, loan_settled_at
+                    FROM customer_order WHERE id = ? FOR UPDATE
+                    """)) {
+                ps.setLong(1, orderId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) throw new DatabaseException("This order no longer exists.");
+                    if (FulfilmentStatus.valueOf(rs.getString(2)).isCancelled()) {
+                        throw new DatabaseException(
+                            "This order was cancelled — there is nothing owed to move to Pay Later.");
+                    }
+                    if (!PaymentStatus.valueOf(rs.getString(1)).awaitsPayment()) {
+                        throw new DatabaseException(
+                            "This order is already paid in full — there is nothing to put on account.");
+                    }
+                    // Already an open debt. A PREVIOUSLY settled one is fine to put back on
+                    // account (it can owe money again after items are added to it), which
+                    // is why this tests the pair rather than loan_at alone.
+                    if (rs.getTimestamp(3) != null && rs.getTimestamp(4) == null) return false;
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE customer_order SET loan_at = now(), loan_settled_at = NULL, loan_staff_id = ? "
+                    + "WHERE id = ? AND " + OFF_LEDGER)) {
+                if (staffId == null) ps.setNull(1, Types.INTEGER); else ps.setInt(1, staffId);
+                ps.setLong(2, orderId);
+                return ps.executeUpdate() == 1;
+            }
+        });
+    }
+
+    /** Undoes {@link #moveToLoan} — for an order put on account by mistake. The order
+     *  returns to the Dashboard still owing what it owed; nothing about its payment or
+     *  fulfilment state was ever changed by moving it. Clears the credit record entirely
+     *  rather than marking it settled, because nothing was collected: this is an erasure of
+     *  something that should never have been recorded, not the end of a debt. */
+    public boolean returnFromLoan(long orderId) throws DatabaseException {
+        return db.inTransaction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE customer_order SET loan_at = NULL, loan_settled_at = NULL, loan_staff_id = NULL "
+                    + "WHERE id = ? AND " + ON_LEDGER)) {
+                ps.setLong(1, orderId);
+                return ps.executeUpdate() == 1;
+            }
+        });
+    }
+
+    /**
+     * The Pay Later ledger: every debt still owed, and nothing else. An order collected in
+     * full settles automatically (see {@link #applyPayment}) and leaves this list for the
+     * Dashboard, so this screen only ever shows money still to come in.
+     *
+     * <p>Deliberately NOT restricted to a business-date range the way loadOrders is: a debt
+     * from three weeks ago is exactly the thing this screen exists to stop anyone
+     * forgetting, so it would be the worst possible row to hide behind a date filter
+     * defaulting to today. Oldest first — the longest-unpaid debt needs chasing most.
+     */
+    public List<OrderRow> loadLoanOrders() throws DatabaseException {
+        String sql = "SELECT " + ORDER_COLUMNS_PREFIXED + ", COALESCE(lc.n, 0) AS item_count "
+            + "FROM customer_order co "
+            + "LEFT JOIN (SELECT order_id, COUNT(*) AS n FROM order_line GROUP BY order_id) lc "
+            + "ON lc.order_id = co.id WHERE " + ON_LEDGER_CO
+            + " ORDER BY co.loan_at ASC";
+        return db.inReadOnly(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(sql);
+                 ResultSet rs = ps.executeQuery()) {
+                List<OrderRow> result = new ArrayList<>();
+                while (rs.next()) {
+                    result.add(new OrderRow(mapOrder(rs, List.of()), rs.getInt("item_count")));
+                }
+                return result;
+            }
+        });
+    }
+
+    /**
+     * Totals for the debts currently on the ledger — and only those. A loan collected in
+     * full settles and leaves, taking its money out of every figure here: it is no longer
+     * outstanding, and it is no longer part-collected either, it is simply a paid order on
+     * the Dashboard. That is what stops a repaid debt showing up twice.
+     *
+     * <p>{@code receivedTotal} is therefore money recovered so far against debts that are
+     * STILL open, and {@code outstandingAmount + receivedTotal} is the credit currently
+     * riding on the ledger.
+     */
+    public record LoanSummary(long outstandingCount, Money outstandingAmount, Money receivedTotal) {}
+
+    public LoanSummary loanSummary() throws DatabaseException {
+        return db.inReadOnly(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT
+                        count(*) AS n,
+                        COALESCE(SUM(total - amount_paid), 0) AS owed,
+                        COALESCE(SUM(amount_paid), 0) AS received
+                    FROM customer_order
+                    WHERE """ + ON_LEDGER + """
+                      AND fulfilment_status <> 'CANCELLED'
+                    """);
+                 ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return new LoanSummary(rs.getLong("n"),
+                    Money.of(rs.getBigDecimal("owed")),
+                    Money.of(rs.getBigDecimal("received")));
+            }
+        });
+    }
+
+    /**
+     * Settles any loan that is already fully paid but somehow still on the ledger — the
+     * self-healing counterpart to {@link #applyPayment}'s own settle step, for a row that
+     * reached PAID some other way (a stale build, a direct DB edit, a bug not yet found).
+     * Run opportunistically by the Pay Later screen before every refresh, so such a row
+     * cannot sit there forever showing "Still Owed Rs 0.00" with no way to clear it — the
+     * Collect action requires an amount greater than zero, which a paid-up order has none
+     * of, so without this a stuck row would need manual SQL to fix.
+     *
+     * @return how many rows were fixed, purely for logging — callers do not need to branch on it.
+     */
+    public int reconcileLoanLedger() throws DatabaseException {
+        return db.inTransaction(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE customer_order SET loan_settled_at = now() WHERE "
+                    + ON_LEDGER + " AND payment_status = 'PAID'")) {
+                return ps.executeUpdate();
+            }
+        });
+    }
+
+    /** Cheap change-detection for the Pay Later poller, same idea as {@link #fingerprint}. */
+    public String loanFingerprint() throws DatabaseException {
+        return db.inReadOnly(conn -> {
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    SELECT count(*)::text || ':' || COALESCE(max(updated_at)::text, '-')
+                    FROM customer_order WHERE """ + ON_LEDGER);
+                 ResultSet rs = ps.executeQuery()) {
+                rs.next();
+                return rs.getString(1);
             }
         });
     }
@@ -847,7 +1275,8 @@ public final class OrderDao {
             rs.getString("order_number"),
             rs.getObject("business_date", LocalDate.class),
             OrderType.valueOf(rs.getString("order_type")),
-            OrderStatus.valueOf(rs.getString("status")),
+            PaymentStatus.valueOf(rs.getString("payment_status")),
+            FulfilmentStatus.valueOf(rs.getString("fulfilment_status")),
             (Integer) rs.getObject("staff_id"),
             rs.getString("staff_name"),
             toOffsetDateTime(rs.getTimestamp("created_at")),
@@ -861,6 +1290,8 @@ public final class OrderDao {
             rs.getString("customer_phone"),
             rs.getString("delivery_address"),
             rs.getString("notes"),
+            toOffsetDateTime(rs.getTimestamp("loan_at")),
+            toOffsetDateTime(rs.getTimestamp("loan_settled_at")),
             lines
         );
     }
@@ -900,7 +1331,15 @@ public final class OrderDao {
         if (draft.type() == OrderType.DINE_IN && rps.util.Validators.isBlank(draft.tableNumber())) {
             return "A table number is required for dine-in orders.";
         }
-        return "A valid phone number is required"
-            + (draft.type() == OrderType.DELIVERY ? ", and delivery needs a valid address." : ".");
+        boolean phoneOptional = draft.type() == OrderType.DINE_IN || draft.isPhoneNotRequired();
+        if (!phoneOptional && rps.util.Validators.isBlank(draft.customerPhone())) {
+            return "A valid phone number is required"
+                + (draft.type() == OrderType.DELIVERY ? ", and delivery needs a valid address." : ".");
+        }
+        if (draft.type() == OrderType.DELIVERY) {
+            return "Delivery needs a valid address.";
+        }
+        return "The phone number entered isn't valid — check the format, or tick "
+            + "\"No phone number\" if the customer won't give one.";
     }
 }

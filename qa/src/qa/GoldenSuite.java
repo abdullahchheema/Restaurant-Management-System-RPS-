@@ -1,7 +1,6 @@
 package qa;
 
 import rps.db.Db;
-import rps.db.DeliveryDao;
 import rps.db.MenuDao;
 import rps.db.OrderDao;
 import rps.db.ReportsDao;
@@ -25,7 +24,6 @@ public final class GoldenSuite {
         Db db = Db.get();
         MenuDao menuDao = new MenuDao(db);
         OrderDao orderDao = new OrderDao(db);
-        DeliveryDao deliveryDao = new DeliveryDao(db);
         ReportsDao reportsDao = new ReportsDao(db);
 
         List<MenuItem> menu = items(menuDao, 3);
@@ -71,8 +69,8 @@ public final class GoldenSuite {
         d5.setCashTendered(pA);
         Order o5 = track(orderDao.saveOrder(d5, 1, "QA"));
         check("TEST005", "Exact cash -> Payment Received, change 0",
-            o5.status() == OrderStatus.PAYMENT_RECEIVED && o5.totals().changeDue().isZero(),
-            o5.status() + " change=" + o5.totals().changeDue());
+            o5.paymentStatus() == PaymentStatus.PAID && o5.totals().changeDue().isZero(),
+            o5.paymentStatus() + " change=" + o5.totals().changeDue());
 
         OrderDraft d6 = draft(OrderType.TAKEAWAY);
         d6.addLine(line(itemA, 1));
@@ -88,9 +86,9 @@ public final class GoldenSuite {
         d7.setCashTendered(Money.of("1"));
         Order o7 = track(orderDao.saveOrder(d7, 1, "QA"));
         check("TEST007", "Underpayment -> NOT settled (Partially Paid)",
-            o7.status() == OrderStatus.PARTIALLY_PAID
+            o7.paymentStatus() == PaymentStatus.PARTIALLY_PAID
                 && o7.totals().balanceDue().equals(o7.totals().total().subtract(Money.of("1"))),
-            o7.status() + " balance=" + o7.totals().balanceDue());
+            o7.paymentStatus() + " balance=" + o7.totals().balanceDue());
 
         // ================================================== DOUBLE SUBMIT
         section("TEST 008-009  Duplicate submission (§7)");
@@ -104,16 +102,18 @@ public final class GoldenSuite {
             "DAO has no idempotency key -> UI MUST prevent the 2nd call. ids "
                 + first.id() + "/" + second.id());
 
-        boolean cancelTwice = orderDao.updateStatus(o3.id(), o3.status(), OrderStatus.CANCELLED, 1);
-        boolean cancelAgain = orderDao.updateStatus(o3.id(), o3.status(), OrderStatus.CANCELLED, 1);
+        boolean cancelTwice = orderDao.updateFulfilment(o3.id(), o3.fulfilmentStatus(), FulfilmentStatus.CANCELLED, 1, false);
+        boolean cancelAgain = orderDao.updateFulfilment(o3.id(), o3.fulfilmentStatus(), FulfilmentStatus.CANCELLED, 1, false);
         check("TEST009", "Double-cancel: 2nd is rejected by optimistic guard",
             cancelTwice && !cancelAgain, "first=" + cancelTwice + " second=" + cancelAgain);
 
         // ================================================== CANCELLATION
         section("TEST 010  Cancellation");
+        // Cancelling now deletes the order outright rather than marking it CANCELLED and
+        // keeping the row -- a voided order leaves no trace anywhere in the system.
         Order o3After = orderDao.loadOrderForPrint(o3.id());
-        check("TEST010", "Cancelled order holds CANCELLED",
-            o3After.status() == OrderStatus.CANCELLED, "" + o3After.status());
+        check("TEST010", "Cancelled order is gone, not marked CANCELLED",
+            o3After == null, o3After == null ? "gone" : "" + o3After.fulfilmentStatus());
 
         // ================================================== HISTORICAL PRICE
         section("TEST 011-012  Menu price change must not rewrite history");
@@ -217,8 +217,8 @@ public final class GoldenSuite {
         dFull.setDiscount(DiscountMode.PERCENT, new BigDecimal("100"));
         Order oFull = track(orderDao.saveOrder(dFull, 1, "QA"));
         check("TEST021", "100% discount -> total 0, settles (not stuck Pending)",
-            oFull.totals().total().isZero() && oFull.status() == OrderStatus.PAYMENT_RECEIVED,
-            "total=" + oFull.totals().total() + " status=" + oFull.status());
+            oFull.totals().total().isZero() && oFull.paymentStatus() == PaymentStatus.PAID,
+            "total=" + oFull.totals().total() + " status=" + oFull.paymentStatus());
 
         expectReject("TEST022", "Discount > 100% rejected", () -> {
             OrderDraft e = draft(OrderType.TAKEAWAY);
@@ -256,19 +256,26 @@ public final class GoldenSuite {
         Order oRec = track(orderDao.saveOrder(dRec, 1, "QA"));
         for (int width : new int[]{48, 32}) {
             ReceiptRenderer r = new ReceiptRenderer(width);
-            String k = r.kitchenTicket(oRec), c = r.customerReceipt(oRec);
+            String k = r.kitchenTicket(oRec).body();
             int w = width;
-            check("TEST026-" + width, "Receipts fit " + width + "-col roll",
-                k.lines().allMatch(l -> l.length() <= w) && c.lines().allMatch(l -> l.length() <= w),
-                "maxK=" + k.lines().mapToInt(String::length).max().orElse(0)
-                    + " maxC=" + c.lines().mapToInt(String::length).max().orElse(0));
+            check("TEST026-" + width, "Kitchen ticket fits " + width + "-col roll",
+                k.lines().allMatch(l -> l.length() <= w),
+                "maxK=" + k.lines().mapToInt(String::length).max().orElse(0));
         }
         ReceiptRenderer r48 = new ReceiptRenderer(48);
-        check("TEST027", "Receipt total == DB total",
-            r48.customerReceipt(oRec).contains(oRec.totals().total().format()),
+        check("TEST027", "Ticket total == DB total",
+            r48.kitchenTicket(oRec).body().contains(oRec.totals().total().format()),
             "want " + oRec.totals().total().format());
         check("TEST028", "Kitchen ticket carries the order note",
-            r48.kitchenTicket(oRec).contains("no onions"), "");
+            r48.kitchenTicket(oRec).body().contains("no onions"), "");
+        // The order number now prints as an oversized headline rather than inside the
+        // body text, so it must survive as its own field -- a ticket whose headline went
+        // missing is one the kitchen cannot identify at a glance, which is the whole
+        // point of the change.
+        check("TEST028h", "Headline carries the day's order sequence",
+            r48.kitchenTicket(oRec).headline()
+                .equals("#" + oRec.orderNumber().substring(oRec.orderNumber().lastIndexOf('-') + 1)),
+            r48.kitchenTicket(oRec).headline());
 
         // The real catalogue contains combo names near 100 characters ("Heavy Deal: 2
         // Chicken Burger + ..."), which used to be written to the roll unwrapped and were
@@ -291,10 +298,8 @@ public final class GoldenSuite {
         Order wideOrder = track(orderDao.saveOrder(wideDraft, 1, "QA"));
         for (int width : new int[]{48, 32}) {
             ReceiptRenderer rw = new ReceiptRenderer(width);
-            String kw = rw.kitchenTicket(wideOrder);
-            String cw = rw.customerReceipt(wideOrder);
-            int worst = Math.max(kw.lines().mapToInt(String::length).max().orElse(0),
-                                 cw.lines().mapToInt(String::length).max().orElse(0));
+            String kw = rw.kitchenTicket(wideOrder).body();
+            int worst = kw.lines().mapToInt(String::length).max().orElse(0);
             check("TEST028w-" + width,
                 "Longest real menu name + unbreakable address fit " + width + "-col roll",
                 worst <= width, "widestName=" + widestItem.name().length() + " worstLine=" + worst);
@@ -313,7 +318,10 @@ public final class GoldenSuite {
                     Locale.forLanguageTag("de-DE"), Locale.forLanguageTag("tr-TR")}) {
                 Locale.setDefault(hostile);
                 String rendered = Money.of("1234.50").format();
-                String receipt = new ReceiptRenderer(48).customerReceipt(oRec);
+                var doc = new ReceiptRenderer(48).kitchenTicket(oRec);
+                // Headline included: it runs through toUpperCase, which is exactly the
+                // call that turns "i" into "İ" under tr-TR.
+                String receipt = doc.headline() + "\n" + doc.body();
                 boolean ok = rendered.equals("Rs 1,234.50")
                     && receipt.chars().allMatch(c -> c < 128 || c == '\n');
                 check("TEST028L-" + hostile.toLanguageTag(),
@@ -328,19 +336,32 @@ public final class GoldenSuite {
         section("TEST 029-031  Report vs raw DB reconciliation (§27)");
 
         var today = OrderDao.businessDate(java.time.ZonedDateTime.now());
-        var filter = new OrderDao.OrderFilter(null, null, today, today);
+        var filter = new OrderDao.OrderFilter(null, null, null, today, today);
         var summary = orderDao.dailySummary(filter);
+        // business_date=today's DATE LITERAL, not CURRENT_DATE: the app's own business
+        // day runs 4am-to-4am (OrderDao#businessDate), so the two disagree for roughly
+        // four hours after midnight -- reproduced live when this suite happened to run at
+        // 00:12, where CURRENT_DATE had already rolled over to the new calendar date but
+        // `today` correctly had not. Binding the same value the DAO itself uses is what
+        // keeps this test meaningful at every hour, not just outside that window.
+        String todayLiteral = "'" + today + "'";
         Money rawRevenue = money(db,
-            "SELECT COALESCE(SUM(total),0) FROM customer_order WHERE business_date=CURRENT_DATE AND status='PAYMENT_RECEIVED'");
+            "SELECT COALESCE(SUM(total),0) FROM customer_order WHERE business_date=" + todayLiteral
+                + " AND payment_status='PAID' AND fulfilment_status<>'CANCELLED'");
         check("TEST029", "dailySummary revenue == raw SQL",
             summary.revenue().equals(rawRevenue), "dao=" + summary.revenue() + " sql=" + rawRevenue);
 
         Money rawOutstanding = money(db,
-            "SELECT COALESCE(SUM(total-amount_paid),0) FROM customer_order WHERE business_date=CURRENT_DATE AND status IN ('PENDING','PARTIALLY_PAID')");
+            "SELECT COALESCE(SUM(total-amount_paid),0) FROM customer_order WHERE business_date=" + todayLiteral
+                + " AND payment_status IN ('UNPAID','PARTIALLY_PAID') AND fulfilment_status<>'CANCELLED'");
         check("TEST030", "dailySummary outstanding == raw SQL",
             summary.outstanding().equals(rawOutstanding), "dao=" + summary.outstanding() + " sql=" + rawOutstanding);
 
-        long rawCount = count(db, "SELECT count(*) FROM customer_order WHERE business_date=CURRENT_DATE");
+        // A cancelled order is excluded from order_count too, not just the money figures
+        // -- a voided order was never really "an order" from the shop's point of view, so
+        // Total Orders reads as a count of real trade rather than a count of table rows.
+        long rawCount = count(db, "SELECT count(*) FROM customer_order "
+            + "WHERE business_date=" + todayLiteral + " AND fulfilment_status<>'CANCELLED'");
         check("TEST031", "dailySummary order count == raw SQL",
             summary.orderCount() == rawCount, "dao=" + summary.orderCount() + " sql=" + rawCount);
 
@@ -360,15 +381,20 @@ public final class GoldenSuite {
         OrderDraft dSm = draft(OrderType.TAKEAWAY);
         dSm.addLine(line(itemA, 1));
         Order oSm = track(orderDao.saveOrder(dSm, 1, "QA"));
-        orderDao.updateStatus(oSm.id(), OrderStatus.PENDING, OrderStatus.CANCELLED, 1);
+        orderDao.updateFulfilment(oSm.id(), FulfilmentStatus.PENDING, FulfilmentStatus.CANCELLED, 1, false);
 
-        check("TEST034", "CANCELLED order refuses further payment",
-            !orderDao.recordPayment(oSm.id(), Money.of("100"), 1), "");
+        // Rejected loudly rather than with a quiet false, unlike TEST036 below: an
+        // already-settled order is a benign no-op, but taking cash against a cancelled
+        // order is a mistake the cashier has to be told about. Cancelling now deletes the
+        // row outright, so this rejects with "order no longer exists" rather than a
+        // cancelled-specific message — either way, no payment can land on a voided order.
+        expectReject("TEST034", "A cancelled (deleted) order refuses further payment",
+            () -> orderDao.recordPayment(oSm.id(), Money.of("100"), 1));
 
         boolean illegalAccepted;
         String how;
         try {
-            illegalAccepted = orderDao.updateStatus(oSm.id(), OrderStatus.CANCELLED, OrderStatus.PAYMENT_RECEIVED, 1);
+            illegalAccepted = orderDao.updateFulfilment(oSm.id(), FulfilmentStatus.CANCELLED, FulfilmentStatus.COMPLETED, 1, false);
             how = illegalAccepted ? "ACCEPTED" : "returned false";
         } catch (Exception e) {
             illegalAccepted = false;
@@ -377,7 +403,7 @@ public final class GoldenSuite {
         check("TEST035", "CANCELLED -> PAYMENT_RECEIVED is an ILLEGAL transition",
             !illegalAccepted, how);
         if (illegalAccepted) {
-            orderDao.updateStatus(oSm.id(), OrderStatus.PAYMENT_RECEIVED, OrderStatus.CANCELLED, 1);
+            orderDao.updateFulfilment(oSm.id(), FulfilmentStatus.PENDING, FulfilmentStatus.CANCELLED, 1, false);
         }
 
         // Legal transitions must still work.
@@ -385,7 +411,7 @@ public final class GoldenSuite {
         dLegal.addLine(line(itemA, 1));
         Order oLegal = track(orderDao.saveOrder(dLegal, 1, "QA"));
         check("TEST035b", "PENDING -> CANCELLED still allowed",
-            orderDao.updateStatus(oLegal.id(), OrderStatus.PENDING, OrderStatus.CANCELLED, 1), "");
+            orderDao.updateFulfilment(oLegal.id(), FulfilmentStatus.PENDING, FulfilmentStatus.CANCELLED, 1, false), "");
 
         Order settled = orderDao.loadOrderForPrint(o5.id());
         check("TEST036", "Settled order refuses further payment",
@@ -423,31 +449,6 @@ public final class GoldenSuite {
         Order oLong = track(orderDao.saveOrder(dLong, 1, "QA"));
         check("TEST039", "5000-char address/notes accepted (TEXT columns)",
             orderDao.loadOrderForPrint(oLong.id()).notes().length() == 5000, "");
-
-        // ================================================== DELIVERY RUNS
-        section("TEST 040-043  Delivery runs");
-
-        Rider rider = deliveryDao.createRider("QA Rider", "03001112222");
-        OrderDraft dr1 = draft(OrderType.DELIVERY); dr1.addLine(line(itemA, 1));
-        OrderDraft dr2 = draft(OrderType.DELIVERY); dr2.addLine(line(itemB, 1));
-        Order r1 = track(orderDao.saveOrder(dr1, 1, "QA"));
-        Order r2 = track(orderDao.saveOrder(dr2, 1, "QA"));
-        DeliveryRun run = deliveryDao.startRun(rider.id(), List.of(r1.id(), r2.id()), 1, "QA");
-        check("TEST040", "Run expects sum of unpaid balances",
-            run.expectedAmount().equals(r1.totals().total().add(r2.totals().total())),
-            "expected=" + run.expectedAmount());
-
-        expectReject("TEST041", "Short collection rejected",
-            () -> deliveryDao.completeRun(run.id(), Money.of("1"), 1));
-
-        deliveryDao.recordPaymentForOrder(r1.id(), r1.totals().total(), 1);
-        check("TEST042", "Per-order collection settles just that order",
-            orderDao.loadOrderForPrint(r1.id()).status() == OrderStatus.PAYMENT_RECEIVED
-                && orderDao.loadOrderForPrint(r2.id()).status() == OrderStatus.PENDING, "");
-
-        deliveryDao.completeRun(run.id(), deliveryDao.loadRun(run.id()).expectedAmount(), 1);
-        check("TEST043", "Completing run settles the remainder",
-            orderDao.loadOrderForPrint(r2.id()).status() == OrderStatus.PAYMENT_RECEIVED, "");
 
         // ================================================== DAILY COUNTER
         section("TEST 044  Order numbering");

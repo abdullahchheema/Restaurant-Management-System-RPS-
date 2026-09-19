@@ -85,19 +85,16 @@ public final class FreshInstallSuite {
 
         Order order = new OrderDao(db).saveOrder(draft, admin.id(), admin.fullName());
         QA.check("FRESH006", "First order saves and settles", order != null,
-            order.orderNumber() + "  " + order.totals().total() + "  " + order.status().label());
+            order.orderNumber() + "  " + order.totals().total() + "  " + order.paymentStatus().label());
         QA.check("FRESH007", "Order number is the first of the day",
             order.orderNumber().matches("\\d{8}-001"), order.orderNumber());
 
         ReceiptRenderer renderer = new ReceiptRenderer(48);
-        String customer = renderer.customerReceipt(order);
-        String kitchen = renderer.kitchenTicket(order);
-        int widest = Math.max(
-            customer.lines().mapToInt(String::length).max().orElse(0),
-            kitchen.lines().mapToInt(String::length).max().orElse(0));
-        QA.check("FRESH008", "Both receipts fit the 48-column roll", widest <= 48, "widest=" + widest);
-        QA.check("FRESH009", "Receipt shows the stored total",
-            customer.contains(order.totals().total().format()), order.totals().total().format());
+        String kitchen = renderer.kitchenTicket(order).body();
+        int widest = kitchen.lines().mapToInt(String::length).max().orElse(0);
+        QA.check("FRESH008", "Kitchen ticket fits the 48-column roll", widest <= 48, "widest=" + widest);
+        QA.check("FRESH009", "Ticket shows the stored total",
+            kitchen.contains(order.totals().total().format()), order.totals().total().format());
 
         QA.section("Shipped default password must not survive");
         QA.check("FRESH010", "Seeded admin123 is rejected as a real password",

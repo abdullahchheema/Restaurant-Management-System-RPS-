@@ -10,27 +10,28 @@ import rps.util.AppSettings;
 import javax.swing.*;
 import java.awt.*;
 
-/** Read-only preview of both receipt documents, rendered exactly as they would print —
- *  same RollSpec/column width ReceiptPrinter uses — without touching a printer. Distinct
- *  from "Reprint Receipts" (which sends straight to the printer) and "View Details"
- *  (which shows a formatted summary, not the literal printed text). */
+/** Read-only preview of the kitchen ticket, rendered exactly as it would print — same
+ *  RollSpec/column width ReceiptPrinter uses — without touching a printer. Distinct from
+ *  "Reprint Receipts" (which sends straight to the printer) and "View Details" (which
+ *  shows a formatted summary, not the literal printed text).
+ *
+ *  <p>One thing this preview cannot reproduce is the order number's printed size: it
+ *  prints oversized and bold, which fixed-width text in a JTextArea cannot show. */
 final class ReceiptPreviewDialog extends JDialog {
 
     ReceiptPreviewDialog(Component parent, Order order) {
-        super(SwingUtilities.getWindowAncestor(parent), "Receipt Preview — " + order.orderNumber(),
+        super(SwingUtilities.getWindowAncestor(parent), "Kitchen Ticket — " + order.orderNumber(),
             ModalityType.APPLICATION_MODAL);
 
-        RollSpec roll = RollSpec.closestTo(AppSettings.get().receiptPaperWidthMm());
+        RollSpec roll = RollSpec.closestTo(AppSettings.get().receiptPaperWidthMm(),
+            AppSettings.get().receiptTextSize());
         ReceiptRenderer renderer = new ReceiptRenderer(roll.columns());
-
-        JTabbedPane tabs = new JTabbedPane();
-        tabs.addTab("Customer Receipt", receiptArea(renderer.customerReceipt(order)));
-        tabs.addTab("Kitchen Ticket", receiptArea(renderer.kitchenTicket(order)));
 
         JPanel content = new JPanel(new BorderLayout(0, 12));
         content.setBackground(Theme.SURFACE);
         content.setBorder(BorderFactory.createEmptyBorder(16, 16, 16, 16));
-        content.add(tabs, BorderLayout.CENTER);
+        content.add(receiptArea(renderer.kitchenTicket(order).toPlainText(roll.columns())),
+            BorderLayout.CENTER);
 
         JButton close = UiFactory.secondaryButton("Close");
         close.addActionListener(e -> dispose());
